@@ -129,6 +129,16 @@ engine.register_strategy("margin", lambda items, k: sorted(items, key=lambda x: 
 
 Checks are AND-ed with policy, can only remove items, fail closed if they raise, and are part of the policy fingerprint (registering one invalidates outstanding receipts). Strategies receive copies of eligible items and their output is validated as a duplicate-free subset — a reranker can reorder or drop, never inject or modify. Registered strategies join the bandit as arms (`explore=False` to opt out) and can be promoted through the same evidence gate.
 
+### Real-LLM walkthrough (notebook)
+
+[`examples/llm_guarded_recommendations.ipynb`](examples/llm_guarded_recommendations.ipynb) puts Claude behind RecGuard as the shopping assistant of an Indian online pharmacy. The LLM sees only the customer's request and the product listings. RecGuard enforces what lives in the backend: verified age, prescription-only (Schedule H) bans, consent, region licensing, stock, Trust & Safety flags, a prompt injection planted in a seller listing, and hallucinated or spoofed SKUs. It then signs, verifies, audits and meters the result.
+
+```bash
+pip install jupyter && jupyter lab examples/llm_guarded_recommendations.ipynb
+```
+
+The notebook reads `ANTHROPIC_API_KEY` from the environment, from the repo's gitignored `.env`, or from a hidden prompt. Three Opus 5.5 calls cost a few cents.
+
 ### Embedded Python SDK
 
 ```python

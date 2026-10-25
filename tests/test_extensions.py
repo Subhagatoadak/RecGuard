@@ -107,7 +107,14 @@ def test_allowlist_item_blocklist_min_score_and_category_cap():
                       c('banned',score=0.99,categories=['books']),c('weak',score=0.1,categories=['music'])],k=3))
     assert [x.item_id for x in d.results]==['b1','m1']
     assert {'CATEGORY_NOT_ALLOWED','DENIED_ITEM','SCORE_BELOW_MINIMUM','CATEGORY_CAP'}<=set(d.reason_codes)
-    assert {x.item_id:x.reason for x in d.rejections}=={'t1':'CATEGORY_NOT_ALLOWED','banned':'DENIED_ITEM','weak':'SCORE_BELOW_MINIMUM'}
+    assert {x.item_id:x.reason for x in d.rejections}=={'t1':'CATEGORY_NOT_ALLOWED','banned':'DENIED_ITEM',
+                                                        'weak':'SCORE_BELOW_MINIMUM','b2':'CATEGORY_CAP'}
+
+
+def test_fallback_repeating_a_primary_item_is_not_a_duplicate():
+    d=engine().evaluate(req([c('a'),c('bad',evidence_ids=[])],k=3,fallback_candidates=[c('a'),c('f'),c('f')]))
+    assert [x.item_id for x in d.results]==['a','f'] and 'DUPLICATE_ITEM' in d.reason_codes
+    assert [(x.item_id,x.source) for x in d.rejections if x.reason=='DUPLICATE_ITEM']==[('f','fallback')]
 
 
 def test_fallback_only_fills_gaps_never_outranks_primary():

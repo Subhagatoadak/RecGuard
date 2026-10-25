@@ -193,14 +193,17 @@ class RecGuard:
         return [by_id[i] for i in ids]
 
     @staticmethod
-    def _fill(picked:list[Candidate], ranked:list[Candidate], k:int, cap:int|None, reasons:Counter) -> int:
+    def _fill(picked:list[Candidate], ranked:list[Candidate], k:int, cap:int|None, reasons:Counter,
+              rejections:list[Rejection], source:str) -> int:
         """Append ranked items until k, honouring the per-category cap. Returns items skipped by the cap."""
         used=Counter(cat for p in picked for cat in p.categories)
         skipped=0
         for item in ranked:
             if len(picked)>=k:break
             if cap is not None and any(used[c]>=cap for c in item.categories):
-                skipped+=1;reasons["CATEGORY_CAP"]+=1;continue
+                skipped+=1;reasons["CATEGORY_CAP"]+=1
+                rejections.append(Rejection(item_id=item.item_id,reason="CATEGORY_CAP",source=source))
+                continue
             picked.append(item);used.update(item.categories)
         return skipped
 
@@ -248,7 +251,10 @@ class RecGuard:
 
     def _admit(self, items, source, req, pol, allow, seen, reasons, rejections) -> int:
         dropped=0
+        batch=set()
         for candidate in items:
+            if source=="fallback" and candidate.item_id in seen and candidate.item_id not in batch:
+                continue  # already offered as a primary candidate; not a rejection
             reason=self._check(candidate,req,pol)
             if reason is None and candidate.item_id in seen:
                 reason="DUPLICATE_ITEM"
@@ -256,7 +262,7 @@ class RecGuard:
                 reasons[reason]+=1;dropped+=1
                 rejections.append(Rejection(item_id=candidate.item_id,reason=reason,source=source))
             else:
-                allow.append(candidate);seen.add(candidate.item_id)
+                allow.append(candidate);seen.add(candidate.item_id);batch.add(candidate.item_id)
         return dropped
 
     def evaluate(self,req:Request)->Decision:
@@ -279,12 +285,13 @@ class RecGuard:
                     strategy,prob=self._strategy(req,pol) if allow else ("base",1.0)
                     if strategy not in self.STRATEGIES:
                         reasons["ACTIVE_STRATEGY_UNAVAILABLE"]+=1;strategy,prob="base",1.0
-                    repaired|=self._fill(output,self._order(allow,strategy,reasons) if allow else [],cap,pol.max_per_category,reasons)>0
+                    repaired|=self._fill(output,self._order(allow,strategy,reasons) if allow else [],cap,pol.max_per_category,
+                                         reasons,rejections,"candidates")>0
                     if len(output)<cap and req.fallback_candidates:
                         backup=[]
                         self._admit(req.fallback_candidates,"fallback",req,pol,backup,seen,reasons,rejections)
                         before=len(output)
-                        self._fill(output,self._rank(backup,"base",len(backup)),cap,pol.max_per_category,reasons)
+                        self._fill(output,self._rank(backup,"base",len(backup)),cap,pol.max_per_category,reasons,rejections,"fallback")
                         repaired|=len(output)>before
                     if len(output)<pol.min_results:output=[]
             elif enabled:
