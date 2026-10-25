@@ -1,0 +1,23 @@
+services:
+  recguard:
+    build: .
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:8765:8765'
+    environment:
+      RECGUARD_SIGNING_KEY: ${RECGUARD_SIGNING_KEY:?RECGUARD_SIGNING_KEY must be set}
+      RECGUARD_TOKENS_JSON: ${RECGUARD_TOKENS_JSON:?RECGUARD_TOKENS_JSON must be set}
+      RECGUARD_DB: /var/lib/recguard/recguard.sqlite
+    volumes:
+      - recguard-data:/var/lib/recguard
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    pids_limit: 128
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  recguard-data:
