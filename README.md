@@ -64,11 +64,13 @@ recguard audit acme --db recguard.db --expected-head <anchored-hash>   # exit 1 
 Startup fails if tokens or signing keys are missing. A persistent embedded database also requires a stable explicit signing key to preserve audit and receipt integrity across restarts. For local API use:
 
 ```bash
-recguard dev-env  # prints fresh env exports for LOCAL DEVELOPMENT ONLY
-# copy/paste the generated export lines into your shell
-uvicorn recguard.api:from_environment --factory --host 127.0.0.1 --port 8765
-# OR, after setting the same environment variables:
-docker compose up --build
+# Docker (no local Python packages needed): writes a gitignored .env that Compose reads
+python3 scripts/dev_env.py --env-file .env
+docker compose up --build          # http://127.0.0.1:8765 ; set RECGUARD_PORT=8766 in .env if 8765 is taken
+
+# Or run directly (after pip install '.[server]')
+eval "$(recguard dev-env)"         # export lines for LOCAL DEVELOPMENT ONLY
+recguard serve --port 8765
 ```
 
 The included Compose deployment is **local-only** (binds `127.0.0.1`, one worker, SQLite volume, dropped Linux capabilities, read-only container root). It is not configured for public HTTPS exposure or high availability.

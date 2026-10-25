@@ -3,7 +3,7 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - '127.0.0.1:8765:8765'
+      - '127.0.0.1:${RECGUARD_PORT:-8765}:8765'
     environment:
       RECGUARD_SIGNING_KEY: ${RECGUARD_SIGNING_KEY:?RECGUARD_SIGNING_KEY must be set}
       RECGUARD_TOKENS_JSON: ${RECGUARD_TOKENS_JSON:?RECGUARD_TOKENS_JSON must be set}
