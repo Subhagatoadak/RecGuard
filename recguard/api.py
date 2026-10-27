@@ -106,6 +106,16 @@ def create_app(engine:RecGuard,token_mapping:dict,max_body_bytes:int=1_000_000)-
         except Denied as exc:denied(exc)
         return {"ok":True,"policy_id":payload.policy.policy_id,"version":payload.policy.version}
 
+    @app.get('/v1/policy-packs')
+    def list_packs(authorization:str|None=Header(default=None)):
+        authorize(authorization,'*','policy:read')
+        return {"packs":engine.policy_packs()}
+
+    @app.post('/v1/policy-packs/refresh')
+    def refresh_packs(authorization:str|None=Header(default=None)):
+        authorize(authorization,'*','policy:write')
+        return {"results":engine.refresh_policy_packs(force=True)}
+
     @app.get('/v1/policies/{tenant_id}')
     def list_policies(tenant_id:str,purpose:str|None=Query(default=None),authorization:str|None=Header(default=None)):
         authorize(authorization,tenant_id,'policy:read')
@@ -244,6 +254,13 @@ def from_environment():
     # `context:` need host data and can only be loaded by an embedding application.
     for path in filter(None,(x.strip() for x in os.getenv('RECGUARD_POLICY_PACKS','').split(','))):
         engine.load_policy_pack(path,data_version=os.getenv('RECGUARD_POLICY_DATA_VERSION') or None)
+    # Re-read pack files and re-fetch due `sources:` in the background (hot reload).
+    interval=float(os.getenv('RECGUARD_POLICY_REFRESH_SECONDS','0') or 0)
+    if not interval:
+        due=[p['refresh_seconds'] for p in engine.policy_packs() if p['refresh_seconds']]
+        interval=min(due) if due else 0
+    if interval:
+        engine.start_auto_refresh(interval)
     return create_app(engine,json.loads(tokens),max_body_bytes=int(os.getenv('RECGUARD_MAX_BODY_BYTES','1000000')))
 
 # Secure-by-default: no default bearer tokens or signing keys.

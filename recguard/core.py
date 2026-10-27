@@ -1,13 +1,13 @@
 """Pure adapter boundary: any recommender supplies candidates; RecGuard governs output."""
 from __future__ import annotations
-import hashlib, hmac, json, re, secrets, sqlite3, time
+import hashlib, hmac, json, re, secrets, sqlite3, threading, time
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable
 from .contracts import Candidate, Decision, DecisionState, Outcome, Policy, Rejection, Request, ShadowReport, Telemetry
 from .storage import Store, canon
 from . import learning
-from .policy_pack import PolicyPack, load_pack
+from .policy_pack import PolicyPack, fetch_sources, load_pack
 
 Check = Callable[[Candidate, Request], "str | None"]
 DecisionCheck = Callable[[list[Candidate], Request], "str | None"]
@@ -52,6 +52,8 @@ class RecGuard:
         self._check_packs: dict[str, str] = {}     # check name -> pack name that owns it
         self._decision_checks: dict[str, tuple[DecisionCheck, str]] = {}  # name -> (fn, "block"|"trim")
         self._shadow: dict[str, dict] = {}  # pack name -> {"policies", "checks", "decision_checks"}; reported, never enforced
+        self._packs: dict[str, dict] = {}   # pack name -> how it was loaded, for refresh and listing
+        self._default_refresh: float | None = None  # set by start_auto_refresh; applies to packs without their own
         self._strategies: dict[str, tuple[Strategy, bool]] = {}
 
     # ---- extension points -------------------------------------------------
@@ -80,6 +82,61 @@ class RecGuard:
         if digest is not None:
             self._check_digests[name] = digest
 
+    @staticmethod
+    def _stale_guard(fn, state):
+        def guarded(subject, request):
+            if time.time() - state["fresh_at"] > state["max_age"]:
+                raise RuntimeError("STALE_SOURCE")  # fails closed as CHECK_ERROR
+            return fn(subject, request)
+        return guarded
+
+    def policy_packs(self) -> list[dict]:
+        """Loaded packs and the health of their data sources."""
+        return [{"pack": name, "mode": info["mode"], "digest": info["digest"], "data_version": info["effective_version"],
+                 "origin": str(info["origin"]) if info["origin"] else None, "sources": list(info["pack"].sources),
+                 "refresh_seconds": info["refresh"], "loaded_at": info["loaded_at"], "data_fresh_at": info["state"]["fresh_at"],
+                 "max_age_seconds": info["state"]["max_age"], "last_error": info["last_error"]}
+                for name, info in sorted(self._packs.items())]
+
+    def refresh_policy_packs(self, force: bool = False) -> list[dict]:
+        """Re-read pack files and re-fetch sources that are due (or all, with `force`).
+
+        A pack is reloaded only when its rules or data changed; a failed refresh keeps the
+        last good version (until a source's max_age_seconds makes its checks fail closed).
+        """
+        results = []
+        now = time.time()
+        for name, info in list(self._packs.items()):
+            period = info["refresh"] or self._default_refresh
+            if not force and not (period and now - info["checked_at"] >= period):
+                continue
+            info["checked_at"] = now
+            try:
+                pack = load_pack(info["origin"]) if info["origin"] else info["pack"]
+                fetched, source_hash = fetch_sources(pack, skip=info["context"])
+                if pack.digest == info["digest"] and source_hash == info["source_hash"]:
+                    info["state"]["fresh_at"] = time.time()
+                    info["last_error"] = None
+                    results.append({"pack": name, "changed": False})
+                    continue
+                summary = self.load_policy_pack(pack, context=info["context"], data_version=info["data_version"],
+                                                _prefetched=(fetched, source_hash))
+                results.append({"pack": name, "changed": True, "data_version": summary["data_version"]})
+            except Exception as exc:
+                info["last_error"] = f"{type(exc).__name__}: {exc}"
+                results.append({"pack": name, "error": info["last_error"]})
+        return results
+
+    def start_auto_refresh(self, interval_seconds: float = 30.0) -> threading.Event:
+        """Refresh due packs in a daemon thread; set the returned event to stop it."""
+        stop = threading.Event()
+        self._default_refresh = interval_seconds
+        def loop():
+            while not stop.wait(interval_seconds):
+                self.refresh_policy_packs()
+        threading.Thread(target=loop, name="recguard-pack-refresh", daemon=True).start()
+        return stop
+
     def unregister_check(self, name: str):
         if name in self._checks:
             del self._checks[name]
@@ -90,7 +147,7 @@ class RecGuard:
         self._check_digests.pop(name, None)
         self._check_packs.pop(name, None)
 
-    def load_policy_pack(self, source, context: dict | None = None, data_version: str | None = None) -> dict:
+    def load_policy_pack(self, source, context: dict | None = None, data_version: str | None = None, _prefetched=None) -> dict:
         """Register a YAML/JSON policy pack: its policies (monotonic versions) and declarative checks.
 
         `context` supplies the host data the pack declares (catalogs, model outputs, helper
@@ -98,10 +155,28 @@ class RecGuard:
         own checks are replaced, so an edited rule takes effect and changes the fingerprint.
         `data_version` names the version of the context data (e.g. a catalog or model run);
         it is part of the fingerprint, so reloading with new data invalidates old receipts.
+        `sources:` the host doesn't supply are fetched; their content hash joins the data version.
         """
         pack = source if isinstance(source, PolicyPack) else load_pack(source)
+        host_context = dict(context or {})
+        fetched, source_hash = _prefetched or fetch_sources(pack, skip=host_context)
+        effective_version = data_version
+        if source_hash:
+            effective_version = f"{data_version}+{source_hash[:16]}" if data_version else f"sources:{source_hash[:16]}"
+        context = {**fetched, **host_context}
         compiled = pack.compile(context)
         compiled_decisions = pack.compile_decisions(context)
+        ages = [s.max_age_seconds for n, s in pack.sources.items() if s.max_age_seconds and n not in host_context]
+        state = {"fresh_at": time.time(), "max_age": min(ages) if ages else None}
+        if state["max_age"]:
+            compiled = {n: self._stale_guard(fn, state) for n, fn in compiled.items()}
+            compiled_decisions = {n: self._stale_guard(fn, state) for n, fn in compiled_decisions.items()}
+        refresh = [s.refresh_seconds for n, s in pack.sources.items() if s.refresh_seconds and n not in host_context]
+        self._packs[pack.name] = {"origin": pack._origin, "pack": pack, "context": host_context, "data_version": data_version,
+                                  "effective_version": effective_version, "source_hash": source_hash, "digest": pack.digest,
+                                  "mode": pack.mode, "loaded_at": time.time(), "checked_at": time.time(), "state": state,
+                                  "refresh": min(refresh) if refresh else None, "last_error": None}
+        data_version = effective_version
         if pack.mode == "shadow":
             with self.db.tx():
                 self._shadow[pack.name] = {"policies": list(pack.policies), "checks": compiled,

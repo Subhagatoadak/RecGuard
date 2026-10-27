@@ -23,11 +23,11 @@ trusted configuration; the interpreter is defense in depth, not a sandbox for ho
 authors. A check whose expression raises at runtime fails closed (CHECK_ERROR).
 """
 from __future__ import annotations
-import ast, hashlib, json, math, operator, re
+import ast, csv, hashlib, io, json, math, operator, os, re, urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 from .contracts import ID, Candidate, Policy, Request
 from .storage import canon
 
@@ -39,6 +39,28 @@ MAX_RANGE = 10_000
 
 class PackError(ValueError):
     """Invalid pack: bad schema, disallowed syntax or unknown names. Message names the location."""
+
+
+class SourceSpec(BaseModel):
+    """Where a context value comes from when no host supplies it (lets the HTTP server run data-driven rules)."""
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["file", "http"]
+    path: str | None = None                # file: relative to the pack file
+    url: str | None = None                 # http: http(s) only
+    format: Literal["json", "yaml", "csv"] | None = None  # default from extension (http: json)
+    key: str | None = None                 # index a list of rows into a mapping by this field
+    headers: dict[str, str] = Field(default_factory=dict)  # values may use ${ENV_VAR}
+    timeout_seconds: float = Field(default=10, gt=0, le=120)
+    max_bytes: int = Field(default=20_000_000, gt=0)
+    refresh_seconds: int | None = Field(default=None, ge=5)    # re-fetch (and reload the pack) this often
+    max_age_seconds: int | None = Field(default=None, ge=5)    # fail closed if data is older than this
+
+    @field_validator("url")
+    @classmethod
+    def http_only(cls, v):
+        if v is not None and not v.lower().startswith(("http://", "https://")):
+            raise ValueError("source url must be http:// or https://")
+        return v
 
 
 class Rule(BaseModel):
@@ -104,11 +126,20 @@ class PolicyPack(BaseModel):
     mode: Literal["enforce", "shadow"] = "enforce"  # shadow: evaluate and report, never change outcomes
     include: list[str] = Field(default_factory=list)
     context: list[str] = Field(default_factory=list)
+    sources: dict[str, SourceSpec] = Field(default_factory=dict)
     constants: dict[str, Any] = Field(default_factory=dict)
     policies: list[Policy] = Field(default_factory=list)
     checks: list[CheckSpec] = Field(default_factory=list)
     decision_checks: list[DecisionCheckSpec] = Field(default_factory=list)
     tests: list[PackTest] = Field(default_factory=list)
+
+    _base_dir: Path | None = PrivateAttr(default=None)
+    _origin: Path | None = PrivateAttr(default=None)
+
+    @property
+    def data_names(self) -> list[str]:
+        """Context names the pack reads: declared host context plus fetched sources."""
+        return list(dict.fromkeys([*self.context, *self.sources]))
 
     @property
     def digest(self) -> str:
@@ -122,20 +153,20 @@ class PolicyPack(BaseModel):
     def compile(self, context: Mapping[str, Any] | None = None) -> dict[str, Callable[[Candidate, Request], str | None]]:
         """Compile every check into a `fn(candidate, request) -> reason | None`."""
         context = dict(context or {})
-        missing = [n for n in self.context if n not in context]
+        missing = [n for n in self.data_names if n not in context]
         if missing:
             raise PackError(f"pack {self.name!r}: context values not provided: {missing}")
-        clash = set(self.constants) & set(context)
+        clash = set(self.constants) & set(self.data_names)
         if clash:
             raise PackError(f"pack {self.name!r}: names defined both as constants and context: {sorted(clash)}")
-        env = {**self.constants, **{n: context[n] for n in self.context}}
+        env = {**self.constants, **{n: context[n] for n in self.data_names}}
         return {spec.name: _compile_check(self, spec, env) for spec in self.checks}
 
     def compile_decisions(self, context: Mapping[str, Any] | None = None) -> dict[str, Callable[[list, Request], str | None]]:
         """Compile every decision check into a `fn(items, request) -> reason | None`."""
         self.compile(context)  # same context validation
         context = dict(context or {})
-        env = {**self.constants, **{n: context[n] for n in self.context}}
+        env = {**self.constants, **{n: context[n] for n in self.data_names}}
         return {spec.name: _compile_check(self, spec, env, kind="decision") for spec in self.decision_checks}
 
     def run_tests(self) -> list[dict]:
@@ -150,7 +181,8 @@ class PolicyPack(BaseModel):
                 items = [Candidate.model_validate({"tenant_id": tenant, "score": 1.0, **row}) for row in rows]
                 req = Request.model_validate({"tenant_id": tenant, "request_id": "pack-test", "purpose": "test",
                                               **test.request, "candidates": items or [Candidate(item_id="none", tenant_id=tenant, score=0)]})
-                checks = self.compile(test.context) if test.item is not None else self.compile_decisions(test.context)
+                test_context = {**dict.fromkeys(self.sources, {}), **test.context}  # tests supply sources inline
+                checks = self.compile(test_context) if test.item is not None else self.compile_decisions(test_context)
                 subject = items[0] if test.item is not None else items
                 got = None
                 for name, fn in checks.items():
@@ -168,7 +200,7 @@ class PolicyPack(BaseModel):
 
     def validate_names(self) -> None:
         """Static validation without context values (used by `recguard policy validate`)."""
-        env_names = set(self.constants) | set(self.context)
+        env_names = set(self.constants) | set(self.data_names)
         for spec in self.checks:
             _compile_check(self, spec, dict.fromkeys(env_names), static_only=True)
         for spec in self.decision_checks:
@@ -196,9 +228,15 @@ def _read(path: Path) -> dict:
 
 def _merge(base: dict, extra: dict, where: str) -> dict:
     """Combine an included pack (`base`) with the including one (`extra`, whose name/description win)."""
-    out = {**base, **{k: v for k, v in extra.items() if k not in ("context", "policies", "checks", "decision_checks", "tests", "constants")}}
+    out = {**base, **{k: v for k, v in extra.items() if k not in ("context", "sources", "policies", "checks", "decision_checks", "tests", "constants")}}
     for key in ("context",):
         out[key] = list(dict.fromkeys(base.get(key, []) + extra.get(key, [])))
+    sources = dict(base.get("sources", {}))
+    for k, v in extra.get("sources", {}).items():
+        if k in sources and sources[k] != v:
+            raise PackError(f"{where}: source {k!r} defined twice with different settings")
+        sources[k] = v
+    out["sources"] = sources
     for key in ("policies", "checks", "decision_checks", "tests"):
         out[key] = base.get(key, []) + extra.get(key, [])
     constants = dict(base.get("constants", {}))
@@ -235,6 +273,8 @@ def load_pack(source: str | Path | Mapping) -> PolicyPack:
         pack = PolicyPack.model_validate(data)
     except Exception as exc:
         raise PackError(f"invalid policy pack: {exc}") from None
+    pack._base_dir = base_dir or Path.cwd()
+    pack._origin = None if isinstance(source, Mapping) else Path(source).resolve()
     names = [c.name for c in pack.checks] + [c.name for c in pack.decision_checks]
     dupes = sorted({n for n in names if names.count(n) > 1})
     if dupes:
@@ -243,6 +283,64 @@ def load_pack(source: str | Path | Mapping) -> PolicyPack:
     if len(keys) != len(set(keys)):
         raise PackError(f"pack {pack.name!r}: a policy_id appears twice for the same tenant")
     return pack
+
+
+# ---- data sources -----------------------------------------------------------------
+
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _parse_payload(raw: bytes, fmt: str, key: str | None, where: str):
+    text = raw.decode("utf-8-sig")
+    if fmt == "json":
+        data = json.loads(text)
+    elif fmt == "yaml":
+        try:
+            import yaml
+        except ImportError:
+            raise PackError("YAML sources need PyYAML: pip install 'recguard-kernel[yaml]'") from None
+        data = yaml.safe_load(text)
+    else:
+        data = [{k: _number(v) if isinstance(v, str) else v for k, v in row.items()} for row in csv.DictReader(io.StringIO(text))]
+    if key is not None:
+        if not isinstance(data, list) or any(not isinstance(r, dict) or key not in r for r in data):
+            raise PackError(f"{where}: `key: {key}` needs a list of rows that all have {key!r}")
+        data = {row[key]: row for row in data}
+    return data
+
+
+def fetch_source(pack: "PolicyPack", name: str, spec: SourceSpec):
+    """Read one source. Raises on any failure (callers keep the last good data)."""
+    where = f"pack {pack.name!r}, source {name!r}"
+    if spec.type == "file":
+        if not spec.path:
+            raise PackError(f"{where}: file sources need `path`")
+        path = (pack._base_dir or Path.cwd()) / spec.path
+        raw = path.read_bytes()
+        fmt = spec.format or {".csv": "csv", ".yaml": "yaml", ".yml": "yaml"}.get(path.suffix.lower(), "json")
+    else:
+        if not spec.url:
+            raise PackError(f"{where}: http sources need `url`")
+        headers = {}
+        for header, value in spec.headers.items():
+            missing = [v for v in _ENV_REF.findall(value) if v not in os.environ]
+            if missing:
+                raise PackError(f"{where}: header {header!r} needs environment variable(s) {missing}")
+            headers[header] = _ENV_REF.sub(lambda m: os.environ[m.group(1)], value)
+        request = urllib.request.Request(spec.url, headers=headers)
+        with urllib.request.urlopen(request, timeout=spec.timeout_seconds) as response:
+            raw = response.read(spec.max_bytes + 1)
+        fmt = spec.format or "json"
+    if len(raw) > spec.max_bytes:
+        raise PackError(f"{where}: source is larger than max_bytes ({spec.max_bytes})")
+    return _parse_payload(raw, fmt, spec.key, where)
+
+
+def fetch_sources(pack: "PolicyPack", skip=()) -> tuple[dict, str]:
+    """Fetch every source not in `skip`; returns (data by name, content hash used as the data version)."""
+    data = {name: fetch_source(pack, name, spec) for name, spec in pack.sources.items() if name not in skip}
+    body = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+    return data, (hashlib.sha256(body.encode()).hexdigest() if data else "")
 
 
 # ---- expression compiler ---------------------------------------------------------
