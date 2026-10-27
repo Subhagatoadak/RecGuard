@@ -19,6 +19,8 @@ oidc = ["pyjwt[crypto]>=2.8"]  # JWT/OIDC bearer tokens from your identity provi
 otel = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp-proto-http>=1.20"]  # traces to any OTLP collector
 signing = ["cryptography>=42"]  # Ed25519-signed policy packs
 mcp = ["mcp>=2.0"]  # MCP server so LLM agents can call RecGuard as tools
+langchain = ["langchain-core>=0.3"]  # recguard.integrations.langchain_guard
+llamaindex = ["llama-index-core>=0.12"]  # recguard.integrations.RecGuardNodePostprocessor
 test = ["pytest>=8", "httpx>=0.27", "fastapi>=0.110", "pyyaml>=6", "pyjwt[crypto]>=2.8", "opentelemetry-sdk>=1.20"]
 
 [project.scripts]
