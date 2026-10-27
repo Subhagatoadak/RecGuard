@@ -17,6 +17,8 @@ constants:
   extrapolation_margin: 1.10    # planned quarter may exceed the highest observed quarter by 10%
   max_change_pct: 30
   max_test_pct: 10
+  cfo_review_cut_pct: 20        # cuts this large wait for CFO approval
+  neutral_tolerance_pct: 5      # budget-neutral plans may drift this % of the quarter budget
 
 policies:
   - policy_id: marketing-governance
@@ -40,11 +42,17 @@ policies:
     purposes: [mmm-insight]
     max_results: 12
     min_results: 1
+  - policy_id: acmehealth-readout       # fact-checked executive-summary sentences
+    version: 1
+    tenant_id: acmehealth
+    purposes: [mmm-readout]
+    max_results: 20
+    min_results: 1
 
 checks:
   - name: fact-check
     description: Every number an insight cites must match the fitted MMM.
-    applies_when: "startswith(item.item_id, 'insight-')"
+    applies_when: "request.purpose == 'mmm-insight'"
     parse_item_id: '^insight-\d+:(?P<channel>[a-z0-9_]+):(?P<metric>[a-z0-9_]+):(?P<value>-?[0-9.]+)$'
     let:
       actual: "get(get(MMM, channel, {}), metric)"
@@ -55,7 +63,7 @@ checks:
 
   - name: mmm
     description: Statistical guardrails on budget actions (channel:action:pct).
-    applies_when: "not startswith(item.item_id, 'insight-')"
+    applies_when: "request.purpose == 'budget-plan'"
     parse_item_id: '^(?P<channel>[a-z0-9_]+):(?P<action>[a-z]+):(?P<pct>\d+)$'
     let:
       m: "MMM[channel]"
@@ -68,7 +76,7 @@ checks:
 
   - name: finance
     description: Quarterly change limits, test budgets and contract floors.
-    applies_when: "not startswith(item.item_id, 'insight-')"
+    applies_when: "request.purpose == 'budget-plan'"
     parse_item_id: '^(?P<channel>[a-z0-9_]+):(?P<action>[a-z]+):(?P<pct>\d+)$'
     let:
       floor: "REGISTRY[channel].contract_floor_pct"
@@ -76,11 +84,49 @@ checks:
       - {reject: TEST_BUDGET_ABOVE_10PCT, if: "action == 'test' and pct > max_test_pct"}
       - {reject: CHANGE_EXCEEDS_30PCT_QUARTERLY_LIMIT, if: "action != 'test' and pct > max_change_pct"}
       - {reject: BELOW_CONTRACTED_MINIMUM, if: "action == 'decrease' and floor is not None and -pct < floor"}
+      - {review: LARGE_CUT_NEEDS_CFO, if: "action == 'decrease' and pct >= cfo_review_cut_pct"}
+
+decision_checks:
+  - name: budget-neutral
+    description: A budget-neutral brief must net to ~zero; trim the moves that break it.
+    applies_when: "request.purpose == 'budget-plan' and request.subject_ref == 'budget-neutral'"
+    on_violation: trim
+    let:
+      moves: "[split(x.item_id, ':') for x in items]"
+      net: "sum(BASE_PLAN[c] * int(p) / 100 * (1 if a == 'increase' else -1 if a == 'decrease' else 0) for c, a, p in moves)"
+      budget: "sum(values(BASE_PLAN))"
+    rules:
+      - {reject: NOT_BUDGET_NEUTRAL, if: "abs(net) > neutral_tolerance_pct / 100 * budget"}
 
 tests:
+  - name: big cut is held for the CFO
+    context:
+      MMM: {meta: {max_spend_corr: 0.2, mroi_low: 0.3, max_quarter_spend_observed: 400}}
+      REGISTRY: {meta: {contract_floor_pct: null}}
+      BASE_PLAN: {meta: 345}
+    item: {item_id: "meta:decrease:25"}
+    request: {purpose: budget-plan}
+    expect: finance:LARGE_CUT_NEEDS_CFO
+  - name: unbalanced budget-neutral plan
+    context:
+      MMM: {}
+      REGISTRY: {}
+      BASE_PLAN: {youtube: 200, meta: 300}
+    request: {purpose: budget-plan, subject_ref: budget-neutral}
+    items: [{item_id: "youtube:increase:30"}, {item_id: "meta:decrease:5"}]
+    expect: budget-neutral:NOT_BUDGET_NEUTRAL
+  - name: balanced budget-neutral plan
+    context:
+      MMM: {}
+      REGISTRY: {}
+      BASE_PLAN: {youtube: 200, meta: 300}
+    request: {purpose: budget-plan, subject_ref: budget-neutral}
+    items: [{item_id: "youtube:increase:30"}, {item_id: "meta:decrease:20"}]
+    expect: null
   - name: misquoted ROI is caught
     context: {MMM: {youtube: {roi: 4.55}}, REGISTRY: {}, BASE_PLAN: {}}
     item: {item_id: "insight-0:youtube:roi:6"}
+    request: {purpose: mmm-insight}
     expect: fact-check:NUMBER_DOES_NOT_MATCH_MMM
   - name: confounded channel cannot be scaled
     context:
@@ -88,6 +134,7 @@ tests:
       REGISTRY: {search: {contract_floor_pct: null}}
       BASE_PLAN: {search: 200}
     item: {item_id: "search:increase:20"}
+    request: {purpose: budget-plan}
     expect: mmm:CONFOUNDED_ATTRIBUTION_RUN_GEO_TEST
   - name: TV cut below the contract floor
     context:
@@ -95,6 +142,7 @@ tests:
       REGISTRY: {tv: {contract_floor_pct: -10}}
       BASE_PLAN: {tv: 450}
     item: {item_id: "tv:decrease:15"}
+    request: {purpose: budget-plan}
     expect: finance:BELOW_CONTRACTED_MINIMUM
   - name: profitable, unconfounded increase within range passes
     context:
@@ -102,4 +150,10 @@ tests:
       REGISTRY: {retail_media: {contract_floor_pct: null}}
       BASE_PLAN: {retail_media: 172}
     item: {item_id: "retail_media:increase:20"}
+    request: {purpose: budget-plan}
+    expect: null
+  - name: summary sentences are not budget actions
+    context: {MMM: {}, REGISTRY: {}, BASE_PLAN: {}}
+    item: {item_id: "sentence-0"}
+    request: {purpose: mmm-readout}
     expect: null

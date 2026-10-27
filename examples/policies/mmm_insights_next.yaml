@@ -1,0 +1,27 @@
+# Next quarter's proposed, stricter thresholds - running in SHADOW mode.
+# Nothing here changes what is approved; RecGuard reports what it *would* change.
+# Promote by setting `mode: enforce` (and folding the rules into mmm_insights.yaml).
+recguard: 1
+name: mmm-insights-next
+mode: shadow
+context: [MMM]
+constants:
+  breakeven_mroi: 1.5           # was 1.0: demand a margin of safety on increases
+  confounding_corr: 0.5         # was 0.7
+  max_increase_pct: 15          # was 30: smaller steps until geo tests calibrate the MMM
+checks:
+  - name: mmm-next
+    applies_when: "request.purpose == 'budget-plan'"
+    parse_item_id: '^(?P<channel>[a-z0-9_]+):(?P<action>[a-z]+):(?P<pct>\d+)$'
+    let:
+      m: "MMM[channel]"
+    rules:
+      - {reject: CONFOUNDED_ATTRIBUTION_RUN_GEO_TEST, if: "action == 'increase' and m.max_spend_corr >= confounding_corr"}
+      - {reject: INCREASE_BELOW_SAFETY_MARGIN, if: "action == 'increase' and m.mroi_low < breakeven_mroi"}
+      - {reject: INCREASE_ABOVE_15PCT, if: "action == 'increase' and pct > max_increase_pct"}
+tests:
+  - name: thin-margin increase would be blocked
+    context: {MMM: {retail_media: {max_spend_corr: 0.2, mroi_low: 1.2}}}
+    item: {item_id: "retail_media:increase:10"}
+    request: {purpose: budget-plan}
+    expect: mmm-next:INCREASE_BELOW_SAFETY_MARGIN

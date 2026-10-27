@@ -154,6 +154,93 @@ engine.load_policy_pack("shop-safety.yaml", context={"CATALOG": catalog}, data_v
 
 Install YAML support with `pip install 'recguard-kernel[yaml]'`; JSON packs need nothing extra. Examples: [`examples/policies/`](examples/policies/), used by all three notebooks. Python `register_check` remains available for logic that doesn't fit a rule.
 
+### Whole-decision rules
+
+`decision_checks:` see the full approved list (`items`, best first) after ranking. Use them for constraints no single item can violate: budget neutrality, a channel's share of spend, diversity quotas, exposure fairness.
+
+```yaml
+decision_checks:
+  - name: budget-neutral
+    applies_when: "request.subject_ref == 'budget-neutral'"
+    on_violation: trim            # or block
+    let: {net: "sum(SPEND[x.item_id] for x in items)"}
+    rules: [{reject: NOT_BUDGET_NEUTRAL, if: "abs(net) > tolerance"}]
+```
+
+`block` blocks the decision. `trim` removes the lowest-ranked item whose removal fixes the violation, then re-checks. The policy's `min_results` still applies afterwards. Pack `tests:` can use `items: [...]` for these rules.
+
+### Shadow mode: roll out rules safely
+
+Give a pack `mode: shadow` and it changes nothing: not the results, not the receipt, not the fingerprint. Instead, every decision carries a `shadow` report listing which served items the new rules **would reject**, which rejected items they **would admit**, and which decision rules **would fire**. `engine.shadow_report(tenant)` / `GET /v1/shadow/{tenant}` aggregate it ("would affect 4% of decisions"). Shadow packs may change policies too; they're overlaid in memory. Reload with `mode: enforce` to go live. A broken shadow rule never affects serving.
+
+### Data sources and hot reload
+
+Packs can fetch their own data, so the HTTP server can run catalog and model-driven rules without a Python host:
+
+```yaml
+sources:
+  CATALOG: {type: file, path: catalog.csv, key: sku}                     # json | yaml | csv
+  MMM: {type: http, url: "https://models.internal/mmm/latest.json",
+        headers: {Authorization: "Bearer ${MMM_TOKEN}"}, refresh_seconds: 300, max_age_seconds: 3600}
+```
+
+* The data's content hash becomes the `data_version`, so new data invalidates old receipts.
+* `refresh_policy_packs()` (or `start_auto_refresh()`, or `RECGUARD_POLICY_REFRESH_SECONDS` on the server) re-reads edited pack files and re-fetches due sources. A pack is reloaded only if something changed.
+* If a fetch fails, the last good data keeps serving until `max_age_seconds`; after that the pack's checks fail closed.
+* Host-supplied `context` always overrides a source.
+* `GET /v1/policy-packs` lists loaded packs and source health; `POST /v1/policy-packs/refresh` forces a refresh.
+
+### Human approval
+
+A rule can `review: REASON` instead of `reject:`, or a policy can set `require_approval: true`. Python checks can `return review("REASON")`. Reviewed items stay in, but the decision is `PENDING_APPROVAL` and its receipt never verifies, so it can't be shown, presented or rewarded.
+
+* `engine.review(tenant, decision_id, approve, reviewer, note)` approves, issuing a fresh receipt bound to the approval state, or rejects, which blocks the decision.
+* Approval is refused if the policy changed or the kill switch is on.
+* Reviewer and note are audited.
+* API: `GET /v1/reviews/{tenant}` and `POST /v1/reviews` (scope `decisions:review`). Over HTTP the reviewer is the token's `subject`, or the OIDC `sub` claim.
+
+### Fact-checking LLM prose
+
+Have the LLM return `claims` alongside its text (`CLAIMS_INSTRUCTION` is a ready-made prompt line), then check them:
+
+```python
+out = engine.fact_check("acme", "mmm-readout", summary, claims, facts=MMM_TABLE)  # or facts_ref="pack/NAME"
+show(out["safe_text"])   # only VERIFIED and number-free sentences
+```
+
+* **Each claim:** the quote must appear verbatim in the text, the quote must state the value (allowing for how it's rounded), the fact must exist, and the value must match within tolerance. A percentage matches a stored fraction.
+* **Every number:** each one must sit inside a verified claim's quote; otherwise its sentence is marked `UNSUPPORTED_NUMBER`.
+* **Signed output:** clean sentences go through the purpose's policy like any candidates. Each carries a hash of its exact wording, so the receipt binds the approved text.
+* `recguard.check_text` is the pure function; `POST /v1/fact-check` is the API.
+
+### Agents and SDKs
+
+* **MCP server:** `recguard mcp` (stdio, sse or streamable-http) gives agents `recguard_evaluate`, `recguard_verify`, `recguard_explain_policy` and `recguard_pending_reviews`. It runs embedded (`RECGUARD_DB` + packs) or against a remote API (`RECGUARD_URL` + `RECGUARD_SERVE_TOKEN`). Approving, presenting and rewarding are deliberately not exposed, so an agent can never approve or reward its own output.
+
+  ```json
+  {"mcpServers": {"recguard": {"command": "recguard", "args": ["mcp"],
+    "env": {"RECGUARD_URL": "https://recguard.internal", "RECGUARD_SERVE_TOKEN": "..."}}}}
+  ```
+* **TypeScript:** [`clients/typescript`](clients/typescript) (`@recguard/client`) is typed and dependency-free (Node 18+, Deno, Bun). `guard()` throws on blocked, pending, unverifiable or unreachable decisions.
+* **LangChain:** `retriever | langchain_guard(engine_or_client, tenant_id=..., purpose=...)`.
+* **LlamaIndex:** `node_postprocessors=[RecGuardNodePostprocessor.create(engine_or_client, tenant, purpose)]`.
+* **Anything else:** `recguard.integrations.guard_items(guard, items, to_candidate=...)`.
+
+  Policy attributes come from trusted index metadata, and approved items come back in RecGuard's order.
+
+### Production deployment
+
+| Concern | How | Install extra |
+|---|---|---|
+| Storage and scale-out | `RECGUARD_DB=postgresql://…` with `RECGUARD_WORKERS=4`. Advisory locks keep each tenant's audit chain linear across workers. See `compose.postgres.yaml`. | `postgres` |
+| Identity (SSO) | `RECGUARD_OIDC_ISSUER`, `RECGUARD_OIDC_AUDIENCE` (+ `_JWKS_URL`, `_TENANT_CLAIM`, `_SCOPE_CLAIM`, `_SCOPE_PREFIX`). JWTs are verified against the provider's JWKS; only asymmetric algorithms are accepted. | `oidc` |
+| Tracing | `RECGUARD_OTEL=1` or `OTEL_EXPORTER_OTLP_ENDPOINT`. Spans for evaluate, verify, reviews, packs and fact-checks carry only content-free attributes. | `otel` |
+| Governed rules | `recguard policy keygen gov` → `recguard policy sign pack.yaml --key gov.key` → `RECGUARD_POLICY_PUBLIC_KEYS=gov.pub`. Unsigned, unknown-key or edited packs are refused, including on hot reload. | `signing` |
+
+```bash
+docker compose -f compose.yaml -f compose.postgres.yaml up --build   # Postgres + 4 workers
+```
+
 ### Plug-ins: custom checks and rerankers
 
 ```python
@@ -233,8 +320,14 @@ A TypeScript caller is included in `examples/node_client.mjs`. Native client imp
 | `GET /v1/metrics/{tenant_id}/prometheus` | `metrics:read` | Minimal Prometheus exposition |
 | `GET /v1/audit/{tenant_id}/verify` | `audit:read` | Recompute audit-chain integrity; `?expected_head=` detects tail deletion |
 | `GET /v1/audit/{tenant_id}/head` | `audit:read` | Current chain head — anchor it externally |
+| `GET /v1/shadow/{tenant_id}` | `metrics:read` | What shadow-mode packs would change |
+| `GET /v1/reviews/{tenant_id}` | `decisions:review` | Decisions waiting for human approval |
+| `POST /v1/reviews` | `decisions:review` | Approve (fresh receipt) or reject a pending decision |
+| `POST /v1/fact-check` | `recommend:serve` | Fact-check LLM prose; returns safe text and a decision over its sentences |
+| `GET /v1/policy-packs` | `policy:read` (tenant `*`) | Loaded packs and data-source health |
+| `POST /v1/policy-packs/refresh` | `policy:write` (tenant `*`) | Re-read pack files and re-fetch sources now |
 
-Server settings: `RECGUARD_POLICY_PACKS` (comma-separated pack files loaded at startup), `RECGUARD_POLICY_DATA_VERSION`, `RECGUARD_RECEIPT_TTL` (seconds, default 300) and `RECGUARD_MAX_BODY_BYTES` (default 1,000,000; larger requests get 413).
+Server settings: `RECGUARD_POLICY_PACKS` (comma-separated pack files loaded at startup), `RECGUARD_POLICY_DATA_VERSION`, `RECGUARD_POLICY_REFRESH_SECONDS`, `RECGUARD_POLICY_PUBLIC_KEYS`, `RECGUARD_RECEIPT_TTL` (seconds, default 300), `RECGUARD_MAX_BODY_BYTES` (default 1,000,000; larger requests get 413), `RECGUARD_WORKERS`, `RECGUARD_OIDC_*` and `RECGUARD_OTEL`.
 
 Tokens are opaque; `RECGUARD_TOKENS_JSON` maps each bearer token to its tenant and scopes. The global-policy token belongs to tenant `*`; a service token for `acme` cannot read/write `other` tenant's data.
 
@@ -283,20 +376,21 @@ Telemetry accepts only structured `event_id`, `tenant_id`, event type, optional 
 - **Enforcement placement:** You cannot force an untrusted application to call RecGuard. Only a trusted host-side integration or controlled egress gateway can enforce the decision; display clients can bypass it otherwise. Treat rendered acknowledgement as an attested host event, not proof a human actually viewed the content.
 - **Incomplete policy inputs:** Candidate metadata and declared consent/evidence may be false. Production needs signed catalog attributes, age/consent verification, data lineage and independent validation of upstream features/algorithms.
 - **Tenancy:** Tenant-scoped API tokens and DB filtering are in place; production requires dedicated schema/db-level RLS and adversarial multi-tenant audits. One tenant with many policies and purposes requires purpose-specific learning cohorts, not global tenant aggregation.
-- **SQLite:** single-node demonstration. Migrate to Postgres with atomic transactions, RLS, migrations, outbox/idempotency and reliable distributed locking for multi-pod service.
+- **Storage:** SQLite suits one host (several workers share the file via WAL and locking). PostgreSQL (`RECGUARD_DB=postgresql://…`) supports multi-worker, multi-pod serving with an advisory-locked audit chain. Still missing for large estates: row-level security per tenant, outbox/idempotency keys, and versioned schema migrations beyond in-place column adds.
 - **Audit:** HMAC hash-chain catches row tampering in retained records. Tail deletion is detected only when you periodically store `GET /v1/audit/{tenant}/head` somewhere immutable and pass it back as `expected_head`. Secret theft compromises chain integrity.
 - **Reward quality:** the service authenticates the trusted sender; it cannot prove that the sender's normalized rewards are unbiased or causal. Delayed and missing rewards can distort metrics and OPE.
 - **Ranking quality:** numeric scores are assumed to be comparable within one request. Diversity and novelty weights are demonstration choices, not tuned market constants.
 - **Policy changes:** receipts invalidate when policy fingerprints change and during kill-switch. Full enforcement after display requires downstream ongoing controls.
-- **Runtime:** API bearer authentication is simple, not a substitute for enterprise IAM, OAuth/OIDC, mTLS, rate limiting, TLS termination or DDoS defense.
+- **Runtime:** OIDC/JWT and scoped static tokens are supported. TLS termination, mTLS, rate limiting and DDoS defence belong in your gateway or ingress.
+- **Decision-wide rules and fact-checking** judge what they are given. A fact-check proves numbers match your trusted table, not that the table is right. `trim` is a greedy repair, not an optimiser.
 - **PII:** request `subject_ref` is never persisted by the kernel, but upstream must provide only pseudonymous values for request IDs, item IDs and coarse segments. Configure application/server logging to avoid printing payloads.
 - **Retention:** `purge` / `POST /v1/data/purge` deletes operational rows on demand; schedule it (cron, k8s CronJob) to match your privacy policy. The audit chain is retained.
 
 ### Suggested next pieces (beyond current weekend starter)
 
-1. Pydantic policy-as-code compiler (OPA/Rego/Cedar interoperability) + property-based invariants.
-2. External governance service and signed policy bundles with approvals and staged rollout.
-3. Full Postgres durability, retention, tenant-level security, Kubernetes deployment and distributed rate limiting.
+1. OPA/Rego/Cedar interoperability for packs, and property-based invariants.
+2. Approval workflows for pack changes themselves (two-person sign-off before `recguard policy sign`) and staged percentage rollouts between shadow and enforce.
+3. Postgres row-level security per tenant, Kubernetes manifests/Helm chart, and distributed rate limiting.
 4. Trusted exposure and business-outcome attribution layer, exploration propensity validity, off-policy audits per purpose/version.
 5. Model-independent adapters for TensorFlow Ranking, implicit/LightFM, sklearn, XGBoost, TorchRec, Feast, Redis and SaaS recommendation providers.
 6. Richer evaluation profiles: NDCG@k from labeled offline sets, calibration, catalog coverage, exposure diversity, fairness constraints, novelty, conversion, margin, uplift, ROI and drift detection.
