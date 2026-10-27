@@ -26,3 +26,16 @@ jobs:
       - run: pytest -q
       - run: python examples/embedded_demo.py
       - run: recguard policy validate examples/policies/*.yaml examples/policies/mmm_budget/*.yaml examples/policies/mmm_budget/extensions/*.yaml
+  typescript-client:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
