@@ -139,6 +139,18 @@ class RetentionRequest(Strict):
     tenant_id: ID
     older_than_seconds: int = Field(ge=3600)
 
+class FactCheckRequest(Strict):
+    tenant_id: ID
+    purpose: ID
+    text: str = Field(min_length=1, max_length=20_000)
+    claims: list[dict] = Field(default_factory=list, max_length=200)
+    facts: dict | None = None                 # trusted facts from your backend, or ...
+    facts_ref: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.\-]*/[A-Za-z_][A-Za-z0-9_]*$")  # "pack/NAME"
+    aliases: dict[str, str] = Field(default_factory=dict)
+    ignore: list[str] = Field(default_factory=list, max_length=20)
+    rel_tolerance: float = Field(default=0.05, ge=0, le=1)
+    abs_tolerance: float = Field(default=0.01, ge=0)
+
 class PolicyRegistration(Strict):
     policy: Policy
 

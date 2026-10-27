@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, ValidationError
 from fastapi.responses import PlainTextResponse
 from .contracts import (Request, BatchRequest, PolicyRegistration, Telemetry, Outcome, VerifyRequest, ModeUpdate,
-                        ServingUpdate, RetentionRequest, ReviewDecision, TokenGrant, ID)
+                        ServingUpdate, RetentionRequest, ReviewDecision, TokenGrant, FactCheckRequest, ID)
 from .core import RecGuard, Denied
 
 class ScopeAuth:
@@ -146,6 +146,17 @@ def create_app(engine:RecGuard,token_mapping:dict|None,max_body_bytes:int=1_000_
         for tenant in {r.tenant_id for r in payload.requests}:
             authorize(authorization,tenant,'recommend:serve')
         return {"decisions":engine.evaluate_many(payload.requests)}
+
+    @app.post('/v1/fact-check')
+    def fact_check(payload:FactCheckRequest,authorization:str|None=Header(default=None)):
+        authorize(authorization,payload.tenant_id,'recommend:serve')
+        try:
+            out=engine.fact_check(payload.tenant_id,payload.purpose,payload.text,payload.claims,payload.facts,
+                                  facts_ref=payload.facts_ref,aliases=payload.aliases,ignore=payload.ignore,
+                                  rel_tolerance=payload.rel_tolerance,abs_tolerance=payload.abs_tolerance)
+        except Denied as exc:denied(exc)
+        except (ValueError,TypeError) as exc:raise HTTPException(422,str(exc)) from None
+        return {"report":out["report"].model_dump(),"decision":out["decision"],"safe_text":out["safe_text"]}
 
     @app.post('/v1/recommendations/verify')
     def verify(req:VerifyRequest,authorization:str|None=Header(default=None)):

@@ -187,7 +187,7 @@ class RecGuard:
             compiled = {n: self._stale_guard(fn, state) for n, fn in compiled.items()}
             compiled_decisions = {n: self._stale_guard(fn, state) for n, fn in compiled_decisions.items()}
         refresh = [s.refresh_seconds for n, s in pack.sources.items() if s.refresh_seconds and n not in host_context]
-        self._packs[pack.name] = {"origin": pack._origin, "pack": pack, "context": host_context, "data_version": data_version,
+        self._packs[pack.name] = {"origin": pack._origin, "pack": pack, "context": host_context, "data": context, "data_version": data_version,
                                   "effective_version": effective_version, "source_hash": source_hash, "digest": pack.digest,
                                   "mode": pack.mode, "loaded_at": time.time(), "checked_at": time.time(), "state": state,
                                   "refresh": min(refresh) if refresh else None, "last_error": None}
@@ -698,6 +698,44 @@ class RecGuard:
             results=self._refresh_policy_packs_impl(force)
             set_attributes(s, changed=sum(1 for r in results if r.get("changed")), errors=sum(1 for r in results if "error" in r))
             return results
+
+    def pack_data(self, ref:str):
+        """Context data a loaded pack holds, as "pack/NAME" (e.g. facts fetched by `sources:`)."""
+        pack_name, _, name = ref.partition("/")
+        info = self._packs.get(pack_name)
+        if info is None or name not in info.get("data", {}):
+            raise Denied("UNKNOWN_FACTS_REF")
+        return info["data"][name]
+
+    def fact_check(self, tenant_id:str, purpose:str, text:str, claims:list, facts=None, *, facts_ref:str|None=None,
+                   request_id:str|None=None, **options) -> dict:
+        """Fact-check prose, then submit its clean sentences as candidates under `purpose`'s policy.
+
+        Returns {"report", "decision", "safe_text"}. Each approved sentence carries a hash of its exact
+        wording, so the receipt binds the text; show only `safe_text` (built from approved sentences).
+        """
+        from .factcheck import check_text, sentence_digest
+        if (facts is None) == (facts_ref is None):
+            raise Denied("PROVIDE_FACTS_OR_FACTS_REF")
+        report = check_text(text, claims, self.pack_data(facts_ref) if facts_ref else facts, **options)
+        clean = [s for s in report.sentences if s.status in ("VERIFIED", "NO_NUMBERS")]
+        with span("recguard.fact_check", tenant=tenant_id, purpose=purpose, verdict=report.verdict,
+                  sentences=len(report.sentences), kept=len(clean), unsupported_numbers=len(report.unsupported_numbers)):
+            if not clean:
+                decision = None
+            else:
+                candidates = [Candidate(item_id=f"sentence-{s.index}", tenant_id=tenant_id, score=1.0 / (s.index + 1),
+                                        categories=["fact-checked" if s.status == "VERIFIED" else "no-numbers"],
+                                        evidence_ids=[sentence_digest(s.text)]) for s in clean]
+                decision = self.evaluate(Request(tenant_id=tenant_id, purpose=purpose, k=min(len(candidates), 50),
+                                                 request_id=request_id or secrets.token_hex(8), candidates=candidates))
+            approved = {r.item_id for r in decision.results} if decision else set()
+            safe = " ".join(s.text for s in clean if f"sentence-{s.index}" in approved)
+            with self.db.tx():
+                self.db.audit(tenant_id, "FACT_CHECK", {"verdict": report.verdict, "counts": report.counts,
+                              "decision_id": decision.decision_id if decision else None,
+                              "text_sha256": hashlib.sha256(text.encode()).hexdigest()})
+        return {"report": report, "decision": decision, "safe_text": safe}
 
     def evaluate_many(self, requests:list[Request]) -> list[Decision]:
         return [self.evaluate(r) for r in requests]
