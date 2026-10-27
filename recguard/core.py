@@ -5,7 +5,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Callable
 from .contracts import Candidate, Decision, DecisionState, Outcome, Policy, Rejection, Request, Review, ReviewItem, ShadowReport, Telemetry
-from .storage import Store, canon
+from .storage import canon, open_store
 from . import learning
 from .policy_pack import PolicyPack, fetch_sources, load_pack
 
@@ -44,9 +44,10 @@ class RecGuard:
     def __init__(self, db_path: str = ":memory:", signing_key: bytes | None = None, receipt_ttl: int = 300):
         if db_path != ":memory:" and signing_key is None:
             raise ValueError("Persistent RecGuard requires a stable explicit signing key")
+        # db_path: ":memory:", a SQLite file, or a postgresql:// URL (multi-worker).
         if not 1 <= receipt_ttl <= 86400:
             raise ValueError("receipt_ttl must be between 1 second and 1 day")
-        self.db = Store(db_path, signing_key or secrets.token_bytes(32))
+        self.db = open_store(db_path, signing_key or secrets.token_bytes(32))
         self.receipt_ttl = receipt_ttl
         self._checks: dict[str, Check] = {}
         self._check_digests: dict[str, str] = {}   # content hash for pack-defined checks
@@ -667,7 +668,7 @@ class RecGuard:
                 if not dec or dec["tenant"]!=event.tenant_id:raise Denied("UNKNOWN_OR_CROSS_TENANT_DECISION")
             try:
                 c.execute("INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",(event.event_id,event.tenant_id,event.decision_id,event.event_type.value,event.latency_ms,event.token_count,event.cost_usd,time.time()))
-            except sqlite3.IntegrityError:
+            except self.db.IntegrityError:
                 raise Denied("DUPLICATE_EVENT")
             self.db.audit(event.tenant_id,"TELEMETRY",{"event_id":event.event_id,"kind":event.event_type.value,"decision_id":event.decision_id})
 
@@ -678,7 +679,7 @@ class RecGuard:
             if not d or d["status"]=="BLOCKED":raise Denied("NO_VERIFIED_PRESENTATION")
             try:
                 c.execute("INSERT INTO outcomes VALUES(?,?,?,?,?,?)",(outcome.outcome_id,outcome.tenant_id,outcome.decision_id,outcome.reward,outcome.outcome_type.value,time.time()))
-            except sqlite3.IntegrityError:
+            except self.db.IntegrityError:
                 raise Denied("DUPLICATE_OR_ALREADY_REWARDED")
             self.db.audit(outcome.tenant_id,"TRUSTED_OUTCOME",{"decision_id":outcome.decision_id,"outcome_id":outcome.outcome_id,"outcome_type":outcome.outcome_type.value})
 
@@ -732,8 +733,10 @@ class RecGuard:
             d=one("SELECT COUNT(*) n,SUM(eligible_count) e,SUM(candidate_count) cand FROM decisions WHERE tenant=?")
             statuses=group("SELECT status,COUNT(*) FROM decisions WHERE tenant=? GROUP BY status")
             strategies=group("SELECT strategy,COUNT(*) FROM decisions WHERE tenant=? GROUP BY strategy")
-            reasons=group("SELECT j.value,COUNT(*) FROM decisions d,json_each(d.reasons) j WHERE d.tenant=? GROUP BY j.value")
-            o=one("SELECT COUNT(*) n,AVG(reward) mean,SUM(kind='CONVERSION' AND reward>0) conv FROM outcomes WHERE tenant=?")
+            reasons=group("SELECT j.value,COUNT(*) FROM decisions d,json_each(d.reasons) j WHERE d.tenant=? GROUP BY j.value"
+                          if self.db.dialect=="sqlite" else
+                          "SELECT j.value,COUNT(*) FROM decisions d,jsonb_array_elements_text(d.reasons::jsonb) AS j(value) WHERE d.tenant=? GROUP BY j.value")
+            o=one("SELECT COUNT(*) n,AVG(reward) mean,SUM(CASE WHEN kind='CONVERSION' AND reward>0 THEN 1 ELSE 0 END) conv FROM outcomes WHERE tenant=?")
             presented=one("SELECT COUNT(*) n FROM presentations WHERE tenant=?")["n"]
             clicked=one("""SELECT COUNT(DISTINCT e.decision_id) n FROM events e JOIN presentations p
                            ON p.decision_id=e.decision_id WHERE e.tenant=? AND e.kind='CLICK'""")["n"]

@@ -1,0 +1,24 @@
+# Production-shaped local stack: PostgreSQL storage and several API workers.
+#   docker compose -f compose.yaml -f compose.postgres.yaml up --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: recguard
+      POSTGRES_USER: recguard
+      POSTGRES_PASSWORD: ${RECGUARD_PG_PASSWORD:?RECGUARD_PG_PASSWORD must be set}
+    volumes:
+      - recguard-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recguard -d recguard"]
+      interval: 5s
+      retries: 20
+  recguard:
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      RECGUARD_DB: postgresql://recguard:${RECGUARD_PG_PASSWORD}@postgres:5432/recguard
+      RECGUARD_WORKERS: ${RECGUARD_WORKERS:-4}
+volumes:
+  recguard-pg:

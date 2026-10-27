@@ -42,6 +42,7 @@ def main(argv=None):
     sub=parser.add_subparsers(dest='cmd',required=True)
     s=sub.add_parser('serve',help='run the HTTP API (needs the `server` extra)')
     s.add_argument('--host',default='127.0.0.1');s.add_argument('--port',type=int,default=8765)
+    s.add_argument('--workers',type=int,default=int(os.getenv('RECGUARD_WORKERS','1')))
     d=sub.add_parser('dev-env',help='print throwaway local secrets');d.add_argument('--tenant',default='demo')
     d.add_argument('--env-file',help='write a Docker Compose .env file instead of export lines')
     a=sub.add_parser('audit',help='verify a tenant audit chain in a database file')
@@ -60,7 +61,7 @@ def main(argv=None):
     elif args.cmd=='serve':
         try:import uvicorn
         except ImportError:sys.exit("install the server extra: pip install 'recguard-kernel[server]'")
-        uvicorn.run('recguard.api:from_environment',factory=True,host=args.host,port=args.port,workers=1)
+        uvicorn.run('recguard.api:from_environment',factory=True,host=args.host,port=args.port,workers=args.workers)
     elif args.cmd=='policy':
         from .policy_pack import PackError, PolicyPack, load_pack
         if args.policy_cmd=='schema':

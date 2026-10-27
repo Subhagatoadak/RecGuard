@@ -18,6 +18,9 @@ def canon(obj: object) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 class Store:
+    dialect = "sqlite"
+    IntegrityError = sqlite3.IntegrityError
+
     def __init__(self, path: str, signing_key: bytes):
         if len(signing_key) < 32:
             raise ValueError("signing key must be at least 32 bytes")
@@ -27,6 +30,7 @@ class Store:
         self.conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")  # several workers on one host share the file
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.lock = threading.RLock()
         with self.tx() as c:
@@ -120,3 +124,132 @@ class Store:
             }
             self.audit(tenant, "RETENTION_PURGE", {"before":before, **counts})
         return counts
+
+
+# ---- PostgreSQL --------------------------------------------------------------------
+
+PG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS recguard_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS policies(tenant TEXT, id TEXT, version BIGINT, purpose TEXT, body TEXT, PRIMARY KEY(tenant,id,version));
+CREATE TABLE IF NOT EXISTS state(tenant TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'OFF', active_strategy TEXT NOT NULL DEFAULT 'base', serving_disabled INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, tenant TEXT NOT NULL, request_id TEXT NOT NULL, purpose TEXT NOT NULL, segment TEXT NOT NULL, strategy TEXT NOT NULL, propensity DOUBLE PRECISION NOT NULL, policy_hash TEXT NOT NULL, status TEXT NOT NULL, output_hash TEXT NOT NULL, receipt TEXT NOT NULL, exp BIGINT NOT NULL, at DOUBLE PRECISION NOT NULL, candidate_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS events(id TEXT NOT NULL, tenant TEXT NOT NULL, decision_id TEXT, kind TEXT NOT NULL, latency_ms DOUBLE PRECISION, token_count BIGINT, cost_usd DOUBLE PRECISION, at DOUBLE PRECISION NOT NULL, PRIMARY KEY(tenant,id));
+CREATE TABLE IF NOT EXISTS presentations(decision_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, at DOUBLE PRECISION NOT NULL);
+CREATE TABLE IF NOT EXISTS outcomes(id TEXT NOT NULL, tenant TEXT NOT NULL, decision_id TEXT NOT NULL UNIQUE, reward DOUBLE PRECISION NOT NULL, kind TEXT NOT NULL, at DOUBLE PRECISION NOT NULL, PRIMARY KEY(tenant,id));
+CREATE TABLE IF NOT EXISTS audit(seq BIGSERIAL PRIMARY KEY, tenant TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, prev_hash TEXT NOT NULL, digest TEXT NOT NULL, at DOUBLE PRECISION NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_decision_tenant ON decisions(tenant,at);
+CREATE INDEX IF NOT EXISTS ix_outcome_decision ON outcomes(decision_id);
+CREATE INDEX IF NOT EXISTS ix_event_tenant ON events(tenant,at);
+CREATE INDEX IF NOT EXISTS ix_audit_tenant ON audit(tenant,seq)
+"""
+
+
+class _PgRow(tuple):
+    """Row readable by name (row["col"]) or position (row[0]), like sqlite3.Row."""
+    _keys: dict
+
+    def __new__(cls, values, keys):
+        row = super().__new__(cls, values)
+        row._keys = keys
+        return row
+
+    def __getitem__(self, key):
+        return tuple.__getitem__(self, self._keys[key] if isinstance(key, str) else key)
+
+    def keys(self):
+        return list(self._keys)
+
+
+def _pg_value(v):
+    from decimal import Decimal
+    if isinstance(v, Decimal):  # SUM() over integers returns numeric in PostgreSQL
+        return int(v) if v == v.to_integral_value() else float(v)
+    return v
+
+
+def _pg_rows(cursor):
+    keys = {d.name: i for i, d in enumerate(cursor.description or [])}
+    return lambda values: _PgRow([_pg_value(v) for v in values], keys)
+
+
+def _pg_sql(sql: str) -> str:
+    """Translate the engine's SQLite-flavoured SQL (the only dialect it writes)."""
+    if "INSERT OR IGNORE INTO" in sql:
+        sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO") + " ON CONFLICT DO NOTHING"
+    return sql.replace("%", "%%").replace("?", "%s")
+
+
+class _PgConn:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        return self._conn.execute(_pg_sql(sql), params)
+
+    def executescript(self, script):
+        for statement in filter(str.strip, script.split(";")):
+            self._conn.execute(statement)
+
+
+class PostgresStore(Store):
+    """Multi-worker store: one connection per thread, explicit transactions, advisory-locked audit chain."""
+    dialect = "postgres"
+
+    def __init__(self, dsn: str, signing_key: bytes):
+        try:
+            import psycopg
+        except ImportError:
+            raise RuntimeError("PostgreSQL needs psycopg: pip install 'recguard-kernel[postgres]'") from None
+        if len(signing_key) < 32:
+            raise ValueError("signing key must be at least 32 bytes")
+        self._psycopg = psycopg
+        self.IntegrityError = psycopg.IntegrityError
+        self.dsn = dsn
+        self.key = signing_key
+        self.audit_key = hmac.new(signing_key, b'recguard:audit:v1', hashlib.sha256).digest()
+        self.receipt_key = hmac.new(signing_key, b'recguard:receipt:v1', hashlib.sha256).digest()
+        self._local = threading.local()
+        with self.tx() as c:
+            c.execute("SELECT pg_advisory_xact_lock(7242024)")  # one migrator at a time across workers
+            c.executescript(PG_SCHEMA)
+            for column, ddl in DECISION_COLUMNS.items():
+                c.execute(f"ALTER TABLE decisions ADD COLUMN IF NOT EXISTS {column} {ddl}")
+            c.execute("INSERT INTO recguard_meta(key,value) VALUES('schema_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                      (str(SCHEMA_VERSION),))
+
+    def _connection(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None or conn.closed:
+            conn = self._psycopg.connect(self.dsn, autocommit=True, row_factory=_pg_rows)
+            self._local.conn, self._local.depth = conn, 0
+        return conn
+
+    @contextmanager
+    def tx(self):
+        conn = self._connection()
+        outer = self._local.depth == 0
+        if outer:
+            conn.execute("BEGIN")
+        self._local.depth += 1
+        try:
+            yield _PgConn(conn)
+            if outer:
+                conn.execute("COMMIT")
+        except BaseException:
+            if outer:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._local.depth -= 1
+
+    def audit(self, tenant: str, kind: str, payload: dict):
+        with self.tx() as c:
+            # Serialise appends per tenant across workers so the hash chain can't fork.
+            c.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (f"recguard-audit:{tenant}",))
+            return super().audit(tenant, kind, payload)
+
+
+def open_store(path: str, signing_key: bytes) -> Store:
+    if path.startswith(("postgresql://", "postgres://")):
+        return PostgresStore(path, signing_key)
+    return Store(path, signing_key)

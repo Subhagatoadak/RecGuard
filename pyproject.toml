@@ -14,6 +14,7 @@ dependencies = ["pydantic>=2.7"]
 [project.optional-dependencies]
 server = ["fastapi>=0.110", "uvicorn>=0.30"]
 yaml = ["pyyaml>=6"]  # YAML policy packs (JSON packs need nothing extra)
+postgres = ["psycopg[binary]>=3.1"]  # multi-worker storage via a postgresql:// RECGUARD_DB
 test = ["pytest>=8", "httpx>=0.27", "fastapi>=0.110", "pyyaml>=6"]
 
 [project.scripts]

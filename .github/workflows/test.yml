@@ -6,11 +6,23 @@ jobs:
     strategy:
       matrix:
         python: ["3.11", "3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: rgtest
+          POSTGRES_DB: recguard
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 20
+    env:
+      RECGUARD_TEST_PG_URL: postgresql://postgres:rgtest@localhost:5432/recguard
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install -e '.[test,server]'
+      - run: pip install -e '.[test,server,postgres]'
       - run: pytest -q
       - run: python examples/embedded_demo.py
+      - run: recguard policy validate examples/policies/*.yaml examples/policies/mmm_budget/*.yaml examples/policies/mmm_budget/extensions/*.yaml
