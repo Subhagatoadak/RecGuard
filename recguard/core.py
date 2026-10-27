@@ -10,6 +10,7 @@ from . import learning
 from .policy_pack import PolicyPack, load_pack
 
 Check = Callable[[Candidate, Request], "str | None"]
+DecisionCheck = Callable[[list[Candidate], Request], "str | None"]
 Strategy = Callable[[list[Candidate], int], list[Candidate]]
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,63}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -49,6 +50,7 @@ class RecGuard:
         self._checks: dict[str, Check] = {}
         self._check_digests: dict[str, str] = {}   # content hash for pack-defined checks
         self._check_packs: dict[str, str] = {}     # check name -> pack name that owns it
+        self._decision_checks: dict[str, tuple[DecisionCheck, str]] = {}  # name -> (fn, "block"|"trim")
         self._strategies: dict[str, tuple[Strategy, bool]] = {}
 
     # ---- extension points -------------------------------------------------
@@ -66,10 +68,24 @@ class RecGuard:
         if digest is not None:
             self._check_digests[name] = digest
 
+    def register_decision_check(self, name: str, fn: DecisionCheck, on_violation: str = "block", digest: str | None = None):
+        """Add a rule over the whole approved list. `block` blocks the decision; `trim` drops
+        lowest-ranked items until it passes. Part of the policy fingerprint like item checks."""
+        if not NAME.match(name) or name in self._checks or name in self._decision_checks:
+            raise ValueError("check name must be a unique identifier")
+        if on_violation not in ("block", "trim"):
+            raise ValueError("on_violation must be 'block' or 'trim'")
+        self._decision_checks[name] = (fn, on_violation)
+        if digest is not None:
+            self._check_digests[name] = digest
+
     def unregister_check(self, name: str):
-        if name not in self._checks:
+        if name in self._checks:
+            del self._checks[name]
+        elif name in self._decision_checks:
+            del self._decision_checks[name]
+        else:
             raise ValueError(f"no check named {name!r}")
-        del self._checks[name]
         self._check_digests.pop(name, None)
         self._check_packs.pop(name, None)
 
@@ -84,7 +100,9 @@ class RecGuard:
         """
         pack = source if isinstance(source, PolicyPack) else load_pack(source)
         compiled = pack.compile(context)
-        foreign = [n for n in compiled if n in self._checks and self._check_packs.get(n) != pack.name]
+        compiled_decisions = pack.compile_decisions(context)
+        foreign = [n for n in [*compiled, *compiled_decisions]
+                   if (n in self._checks or n in self._decision_checks) and self._check_packs.get(n) != pack.name]
         if foreign:
             raise ValueError(f"check name(s) {foreign} already registered outside pack {pack.name!r}")
         registered, unchanged = [], []
@@ -105,8 +123,15 @@ class RecGuard:
                     digest=hashlib.sha256(f"{digest}:{data_version}".encode()).hexdigest()
                 self.register_check(spec.name, compiled[spec.name], digest=digest)
                 self._check_packs[spec.name] = pack.name
+            for spec in pack.decision_checks:
+                digest=pack.check_digest(spec)
+                if data_version is not None:
+                    digest=hashlib.sha256(f"{digest}:{data_version}".encode()).hexdigest()
+                self.register_decision_check(spec.name, compiled_decisions[spec.name], spec.on_violation, digest=digest)
+                self._check_packs[spec.name] = pack.name
             summary = {"pack": pack.name, "digest": pack.digest, "data_version": data_version, "policies_registered": registered,
-                       "policies_unchanged": unchanged, "checks": [c.name for c in pack.checks]}
+                       "policies_unchanged": unchanged, "checks": [c.name for c in pack.checks],
+                       "decision_checks": [c.name for c in pack.decision_checks]}
             self.db.audit("*", "POLICY_PACK_LOADED", summary)
         return summary
 
@@ -158,7 +183,10 @@ class RecGuard:
         caps=[p.max_per_category for p in relevant if p.max_per_category is not None]
         body=[p.model_dump(mode="json") for p in sorted(relevant, key=lambda x:(x.tenant_id or "*",x.policy_id,x.version))]
         checks={name:self._check_digests.get(name,"code") for name in sorted(self._checks)}
-        fp=hashlib.sha256(canon({"policies":body,"checks":checks}).encode()).hexdigest()
+        material={"policies":body,"checks":checks}
+        if self._decision_checks:
+            material["decision_checks"]={n:[self._check_digests.get(n,"code"),mode] for n,(_,mode) in sorted(self._decision_checks.items())}
+        fp=hashlib.sha256(canon(material).encode()).hexdigest()
         return EffectivePolicy(
             denied=frozenset(cat for p in relevant for cat in p.denied_categories),
             regions=frozenset(set.intersection(*allowed)) if allowed else None,
@@ -316,6 +344,36 @@ class RecGuard:
                 allow.append(candidate);seen.add(candidate.item_id);batch.add(candidate.item_id)
         return dropped
 
+    def _apply_decision_checks(self, output:list[Candidate], req:Request, reasons:Counter, rejections:list) -> bool:
+        """Run whole-decision rules on the approved list in place. Returns True if anything was removed."""
+        changed=False
+        for name,(fn,mode) in self._decision_checks.items():
+            while output:
+                try:
+                    reason=fn(list(output),req)
+                except Exception:
+                    reason="CHECK_ERROR"
+                if reason is None:
+                    break
+                code=f"{name}:{reason}" if reason!="CHECK_ERROR" else f"CHECK_ERROR:{name}"
+                reasons[code]+=1
+                if mode=="block" or reason=="CHECK_ERROR":
+                    rejections.extend(Rejection(item_id=x.item_id,reason=code,source="decision") for x in output)
+                    output.clear()
+                else:
+                    # Prefer the lowest-ranked item whose removal fixes the violation; else drop the last one.
+                    index=len(output)-1
+                    for i in range(len(output)-1,-1,-1):
+                        try:
+                            if fn(output[:i]+output[i+1:],req) is None:
+                                index=i;break
+                        except Exception:
+                            continue
+                    dropped=output.pop(index)
+                    rejections.append(Rejection(item_id=dropped.item_id,reason=code,source="decision"))
+                changed=True
+        return changed
+
     def evaluate(self,req:Request)->Decision:
         # One transaction: kill switch, policy, strategy and the logged decision are consistent.
         with self.db.tx() as c:
@@ -344,6 +402,7 @@ class RecGuard:
                         before=len(output)
                         self._fill(output,self._rank(backup,"base",len(backup)),cap,pol.max_per_category,reasons,rejections,"fallback")
                         repaired|=len(output)>before
+                    repaired|=self._apply_decision_checks(output,req,reasons,rejections)
                     if len(output)<pol.min_results:output=[]
             elif enabled:
                 reasons["NO_APPLICABLE_POLICY"]+=1

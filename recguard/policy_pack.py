@@ -69,12 +69,29 @@ class CheckSpec(BaseModel):
         return v
 
 
+class DecisionCheckSpec(BaseModel):
+    """A rule over the whole approved list (`items`, best first), run after ranking.
+
+    `on_violation: block` blocks the decision; `trim` removes the lowest-ranked item whose
+    removal fixes the violation (or, if none does alone, the lowest-ranked item) and re-checks
+    until the rule passes. The policy's min_results still applies afterwards.
+    """
+    model_config = ConfigDict(extra="forbid")
+    name: ID
+    description: str = ""
+    applies_when: str | None = Field(default=None, max_length=MAX_EXPRESSION)
+    on_violation: Literal["block", "trim"] = "block"
+    let: dict[str, str] = Field(default_factory=dict)
+    rules: list[Rule] = Field(min_length=1)
+
+
 class PackTest(BaseModel):
     """An example the pack must classify correctly; run by `recguard policy validate`."""
     model_config = ConfigDict(extra="forbid")
     name: str
     context: dict[str, Any] = Field(default_factory=dict)   # plain data standing in for host context
-    item: dict[str, Any]                                     # Candidate fields; tenant_id defaults to "test"
+    item: dict[str, Any] | None = None                       # Candidate fields; tenant_id defaults to "test"
+    items: list[dict[str, Any]] | None = None                # for decision checks: the approved list, best first
     request: dict[str, Any] = Field(default_factory=dict)    # Request fields; purpose defaults to "test"
     expect: str | None                                       # "check:REASON", or null to admit
 
@@ -89,13 +106,14 @@ class PolicyPack(BaseModel):
     constants: dict[str, Any] = Field(default_factory=dict)
     policies: list[Policy] = Field(default_factory=list)
     checks: list[CheckSpec] = Field(default_factory=list)
+    decision_checks: list[DecisionCheckSpec] = Field(default_factory=list)
     tests: list[PackTest] = Field(default_factory=list)
 
     @property
     def digest(self) -> str:
         return hashlib.sha256(canon(self.model_dump(mode="json", by_alias=True)).encode()).hexdigest()
 
-    def check_digest(self, spec: CheckSpec) -> str:
+    def check_digest(self, spec: CheckSpec | DecisionCheckSpec) -> str:
         """Content hash of one check plus the constants it can read."""
         body = {"check": spec.model_dump(mode="json", by_alias=True), "constants": self.constants}
         return hashlib.sha256(canon(body).encode()).hexdigest()
@@ -112,20 +130,31 @@ class PolicyPack(BaseModel):
         env = {**self.constants, **{n: context[n] for n in self.context}}
         return {spec.name: _compile_check(self, spec, env) for spec in self.checks}
 
+    def compile_decisions(self, context: Mapping[str, Any] | None = None) -> dict[str, Callable[[list, Request], str | None]]:
+        """Compile every decision check into a `fn(items, request) -> reason | None`."""
+        self.compile(context)  # same context validation
+        context = dict(context or {})
+        env = {**self.constants, **{n: context[n] for n in self.context}}
+        return {spec.name: _compile_check(self, spec, env, kind="decision") for spec in self.decision_checks}
+
     def run_tests(self) -> list[dict]:
         """Run the pack's own `tests:` against its checks (policies are not involved)."""
         results = []
         for test in self.tests:
             try:
-                checks = self.compile(test.context)
-                tenant = test.item.get("tenant_id", "test")
-                item = Candidate.model_validate({"tenant_id": tenant, "score": 1.0, **test.item})
+                if (test.item is None) == (test.items is None):
+                    raise ValueError("a test needs exactly one of `item` or `items`")
+                rows = [test.item] if test.item is not None else test.items
+                tenant = (rows[0] if rows else {}).get("tenant_id", "test")
+                items = [Candidate.model_validate({"tenant_id": tenant, "score": 1.0, **row}) for row in rows]
                 req = Request.model_validate({"tenant_id": tenant, "request_id": "pack-test", "purpose": "test",
-                                              **test.request, "candidates": [item]})
+                                              **test.request, "candidates": items or [Candidate(item_id="none", tenant_id=tenant, score=0)]})
+                checks = self.compile(test.context) if test.item is not None else self.compile_decisions(test.context)
+                subject = items[0] if test.item is not None else items
                 got = None
                 for name, fn in checks.items():
                     try:
-                        reason = fn(item, req)
+                        reason = fn(subject, req)
                     except Exception as exc:
                         reason = f"CHECK_ERROR ({type(exc).__name__}: {exc})"
                     if reason is not None:
@@ -141,6 +170,8 @@ class PolicyPack(BaseModel):
         env_names = set(self.constants) | set(self.context)
         for spec in self.checks:
             _compile_check(self, spec, dict.fromkeys(env_names), static_only=True)
+        for spec in self.decision_checks:
+            _compile_check(self, spec, dict.fromkeys(env_names), static_only=True, kind="decision")
 
 
 # ---- loading -------------------------------------------------------------------
@@ -164,10 +195,10 @@ def _read(path: Path) -> dict:
 
 def _merge(base: dict, extra: dict, where: str) -> dict:
     """Combine an included pack (`base`) with the including one (`extra`, whose name/description win)."""
-    out = {**base, **{k: v for k, v in extra.items() if k not in ("context", "policies", "checks", "tests", "constants")}}
+    out = {**base, **{k: v for k, v in extra.items() if k not in ("context", "policies", "checks", "decision_checks", "tests", "constants")}}
     for key in ("context",):
         out[key] = list(dict.fromkeys(base.get(key, []) + extra.get(key, [])))
-    for key in ("policies", "checks", "tests"):
+    for key in ("policies", "checks", "decision_checks", "tests"):
         out[key] = base.get(key, []) + extra.get(key, [])
     constants = dict(base.get("constants", {}))
     for k, v in extra.get("constants", {}).items():
@@ -203,7 +234,7 @@ def load_pack(source: str | Path | Mapping) -> PolicyPack:
         pack = PolicyPack.model_validate(data)
     except Exception as exc:
         raise PackError(f"invalid policy pack: {exc}") from None
-    names = [c.name for c in pack.checks]
+    names = [c.name for c in pack.checks] + [c.name for c in pack.decision_checks]
     dupes = sorted({n for n in names if names.count(n) > 1})
     if dupes:
         raise PackError(f"pack {pack.name!r}: duplicate check names {dupes}")
@@ -243,6 +274,7 @@ FUNCTIONS: dict[str, Callable] = {
     "keys": lambda m: list(m.keys()), "values": lambda m: list(m.values()), "items": lambda m: list(m.items()),
     "startswith": lambda s, p: str(s).startswith(p), "endswith": lambda s, p: str(s).endswith(p),
     "lower": lambda s: str(s).lower(), "upper": lambda s: str(s).upper(), "matches": _matches, "search": _search,
+    "split": lambda s, sep, maxsplit=-1: str(s).split(sep, maxsplit), "join": lambda sep, xs: str(sep).join(map(str, xs)),
 }
 BUILTIN_NAMES = {"None", "True", "False"}
 
@@ -518,12 +550,14 @@ def _number(text: str):
     return text
 
 
-def _compile_check(pack: PolicyPack, spec: CheckSpec, env: dict, static_only: bool = False):
-    where = f"pack {pack.name!r}, check {spec.name!r}"
-    pattern = re.compile(spec.parse_item_id) if spec.parse_item_id else None
+def _compile_check(pack: PolicyPack, spec, env: dict, static_only: bool = False, kind: str = "item"):
+    where = f"pack {pack.name!r}, {'decision check' if kind == 'decision' else 'check'} {spec.name!r}"
+    raw_pattern = getattr(spec, "parse_item_id", None)
+    pattern = re.compile(raw_pattern) if raw_pattern else None
     groups = set(pattern.groupindex) if pattern else set()
-    known = set(env) | set(FUNCTIONS) | BUILTIN_NAMES | {"item", "request"} | groups | set(spec.let)
-    for reserved in ("item", "request", *FUNCTIONS):
+    subject = "items" if kind == "decision" else "item"
+    known = set(env) | set(FUNCTIONS) | BUILTIN_NAMES | {subject, "request"} | groups | set(spec.let)
+    for reserved in ("item", "items", "request", *FUNCTIONS):
         if reserved in spec.let or reserved in groups or reserved in env:
             raise PackError(f"{where}: {reserved!r} is reserved and cannot be redefined")
 
@@ -542,15 +576,15 @@ def _compile_check(pack: PolicyPack, spec: CheckSpec, env: dict, static_only: bo
         return None
     base = {**FUNCTIONS, "None": None, "True": True, "False": False, **env}
 
-    def check(candidate: Candidate, request: Request) -> str | None:
+    def check(candidate, request: Request) -> str | None:
         budget = _Budget()
         root = _Scope(lazy=lets, budget=budget)
         root.update(base)
-        root["item"], root["request"] = candidate, request
+        root[subject], root["request"] = (list(candidate) if kind == "decision" else candidate), request
         if applies is not None and not applies(root, budget):
             return None
         if pattern is not None:
-            match = pattern.fullmatch(candidate.item_id)
+            match = pattern.fullmatch(candidate.item_id)  # item checks only
             if match is None:
                 return spec.on_unparseable
             root.update({k: _number(v) if v is not None else None for k, v in match.groupdict().items()})
