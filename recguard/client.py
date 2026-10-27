@@ -85,6 +85,11 @@ class RecGuardClient:
             'event_id':event_id or uuid.uuid4().hex,'decision_id':decision_id,**measures},self.telemetry_token)
 
 
+    def effective_policy(self,tenant_id:str,purpose:str) -> dict | None:
+        """The composed policy RecGuard enforces (needs policy:read on the serve token)."""
+        from urllib.parse import quote
+        return self._call('GET',f'/v1/policies/{quote(tenant_id)}?purpose={quote(purpose)}',self.serve_token)['effective']
+
     def pending_reviews(self,tenant_id:str) -> list[dict]:
         return self._call('GET',f'/v1/reviews/{tenant_id}',self.review_token)['pending']
 

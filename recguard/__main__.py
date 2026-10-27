@@ -43,6 +43,8 @@ def main(argv=None):
     s=sub.add_parser('serve',help='run the HTTP API (needs the `server` extra)')
     s.add_argument('--host',default='127.0.0.1');s.add_argument('--port',type=int,default=8765)
     s.add_argument('--workers',type=int,default=int(os.getenv('RECGUARD_WORKERS','1')))
+    m=sub.add_parser('mcp',help='run the MCP server so LLM agents can call RecGuard (needs the `mcp` extra)')
+    m.add_argument('--transport',default='stdio',choices=['stdio','sse','streamable-http'])
     d=sub.add_parser('dev-env',help='print throwaway local secrets');d.add_argument('--tenant',default='demo')
     d.add_argument('--env-file',help='write a Docker Compose .env file instead of export lines')
     a=sub.add_parser('audit',help='verify a tenant audit chain in a database file')
@@ -62,6 +64,9 @@ def main(argv=None):
     vf=psub.add_parser('verify',help='check a pack signature against trusted public keys')
     vf.add_argument('file');vf.add_argument('--pub',required=True,action='append')
     args=parser.parse_args(argv)
+    if args.cmd=='mcp':
+        from .mcp_server import main as mcp_main
+        mcp_main(args.transport);return
     if args.cmd=='dev-env':
         dev_env(args.tenant,args.env_file)
     elif args.cmd=='serve':
