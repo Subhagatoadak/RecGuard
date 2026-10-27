@@ -60,6 +60,7 @@ class Policy(Strict):
     min_score: float | None = None
     max_per_category: int | None = Field(default=None, ge=1, le=50)  # exposure/diversity cap per category
     enabled: bool = True  # retire a policy by registering a new version with enabled: false
+    require_approval: bool = False  # every non-blocked decision for this scope waits for a human
 
     @field_validator("min_score")
     @classmethod
@@ -72,11 +73,24 @@ class DecisionState(StrEnum):
     PASS = "PASS"
     REPAIRED = "REPAIRED"
     BLOCKED = "BLOCKED"
+    PENDING_APPROVAL = "PENDING_APPROVAL"  # results held until a human approves (receipt invalid until then)
+
+
+class Review(str):
+    """Returned by a check to admit an item but require human approval: `return review("HIGH_SPEND")`."""
+
+
+def review(reason: str) -> Review:
+    return Review(reason)
 
 class Rejection(Strict):
     item_id: ID
     reason: str
     source: str  # "candidates" or "fallback"
+
+class ReviewItem(Strict):
+    item_id: ID | None  # None: the whole decision needs review
+    reason: str
 
 class ShadowReport(Strict):
     """What shadow-mode packs would change; never affects what is served."""
@@ -99,6 +113,7 @@ class Decision(Strict):
     expires_at: int
     rejections: list[Rejection] = Field(default_factory=list)  # explain why each item was dropped
     shadow: ShadowReport | None = None  # present when shadow-mode packs are loaded
+    review_required: list[ReviewItem] = Field(default_factory=list)  # why the decision is PENDING_APPROVAL
 
 class Telemetry(Strict):
     event_id: ID
@@ -145,3 +160,10 @@ class ServingUpdate(Strict):
 class TokenGrant(Strict):
     tenant_id: ID | Literal["*"]
     scopes: list[ID] = Field(min_length=1)
+    subject: ID | None = None  # who holds the token (recorded as the reviewer on approvals)
+
+class ReviewDecision(Strict):
+    tenant_id: ID
+    decision_id: ID
+    approve: bool
+    note: str = Field(default="", max_length=500)

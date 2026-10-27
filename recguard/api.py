@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, ValidationError
 from fastapi.responses import PlainTextResponse
 from .contracts import (Request, BatchRequest, PolicyRegistration, Telemetry, Outcome, VerifyRequest, ModeUpdate,
-                        ServingUpdate, RetentionRequest, TokenGrant, ID)
+                        ServingUpdate, RetentionRequest, ReviewDecision, TokenGrant, ID)
 from .core import RecGuard, Denied
 
 class ScopeAuth:
@@ -86,7 +86,7 @@ def create_app(engine:RecGuard,token_mapping:dict,max_body_bytes:int=1_000_000)-
     app.add_middleware(BodyLimit,limit=max_body_bytes)
 
     def authorize(authorization:str|None,tenant:str,scope:str):
-        auth.require(authorization,scope,tenant)
+        return auth.require(authorization,scope,tenant)
 
     def denied(exc:Denied):
         raise HTTPException(409,str(exc)) from exc
@@ -199,6 +199,18 @@ def create_app(engine:RecGuard,token_mapping:dict,max_body_bytes:int=1_000_000)-
     def metrics(tenant_id:str,authorization:str|None=Header(default=None)):
         authorize(authorization,tenant_id,'metrics:read')
         return engine.metrics(tenant_id)
+
+    @app.get('/v1/reviews/{tenant_id}')
+    def pending(tenant_id:str,authorization:str|None=Header(default=None)):
+        authorize(authorization,tenant_id,'decisions:review')
+        return {"pending":engine.pending_reviews(tenant_id)}
+
+    @app.post('/v1/reviews')
+    def review(payload:ReviewDecision,authorization:str|None=Header(default=None)):
+        grant=authorize(authorization,payload.tenant_id,'decisions:review')
+        reviewer=grant.subject or "token:"+hashlib.sha256((authorization or "").encode()).hexdigest()[:12]
+        try:return engine.review(payload.tenant_id,payload.decision_id,payload.approve,reviewer,payload.note)
+        except Denied as exc:denied(exc)
 
     @app.get('/v1/shadow/{tenant_id}')
     def shadow(tenant_id:str,authorization:str|None=Header(default=None)):

@@ -4,7 +4,7 @@ import hashlib, hmac, json, re, secrets, sqlite3, threading, time
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable
-from .contracts import Candidate, Decision, DecisionState, Outcome, Policy, Rejection, Request, ShadowReport, Telemetry
+from .contracts import Candidate, Decision, DecisionState, Outcome, Policy, Rejection, Request, Review, ReviewItem, ShadowReport, Telemetry
 from .storage import Store, canon
 from . import learning
 from .policy_pack import PolicyPack, fetch_sources, load_pack
@@ -35,6 +35,7 @@ class EffectivePolicy:
     denied_items: frozenset[str] = frozenset()
     min_score: float | None = None
     max_per_category: int | None = None
+    require_approval: bool = False
 
 
 class RecGuard:
@@ -289,7 +290,8 @@ class RecGuard:
             allowed_categories=frozenset(set.intersection(*allowed_cats)) if allowed_cats else None,
             denied_items=frozenset(i for p in relevant for i in p.denied_item_ids),
             min_score=max(scores) if scores else None,
-            max_per_category=min(caps) if caps else None)
+            max_per_category=min(caps) if caps else None,
+            require_approval=any(p.require_approval for p in relevant))
 
     def effective_policy(self, tenant: str, purpose: str) -> dict | None:
         """Composed policy actually enforced for a tenant/purpose (for debugging integrations)."""
@@ -302,6 +304,7 @@ class RecGuard:
                 "require_evidence":pol.evidence,"require_consent_for_personalization":pol.consent,
                 "min_results":pol.min_results,"max_results":pol.max_results,"min_score":pol.min_score,
                 "max_per_category":pol.max_per_category,"allow_experiment":pol.experiment,"high_impact":pol.high_impact,
+                "require_approval":pol.require_approval,
                 "custom_checks":sorted(self._checks)}
 
     def _check(self, c:Candidate, req:Request, pol:EffectivePolicy, checks:dict|None=None) -> str | None:
@@ -316,14 +319,17 @@ class RecGuard:
         if pol.evidence and not c.evidence_ids:return "EVIDENCE_REQUIRED"
         if pol.consent and not req.personalization_consent and c.uses_personal_data:return "CONSENT_REQUIRED"
         if pol.min_score is not None and c.score<pol.min_score:return "SCORE_BELOW_MINIMUM"
+        flagged=None
         for name,fn in (self._checks if checks is None else checks).items():
             try:
                 reason=fn(c.model_copy(deep=True),req)
             except Exception:
                 return f"CHECK_ERROR:{name}"
-            if reason is not None:
+            if isinstance(reason,Review):
+                flagged=flagged or Review(f"{name}:{reason}")  # admit, but needs approval
+            elif reason is not None:
                 return f"{name}:{reason}"
-        return None
+        return flagged
 
     # ---- ranking ----------------------------------------------------------
 
@@ -380,8 +386,9 @@ class RecGuard:
     def _hash_results(items:list[Candidate]) -> str:
         return hashlib.sha256(canon([x.model_dump(mode='json') for x in items]).encode()).hexdigest()
 
-    def _signature(self, tenant, did, hash_, exp, policy_hash):
-        payload=canon([tenant,did,hash_,exp,policy_hash])
+    def _signature(self, tenant, did, hash_, exp, policy_hash, approval=None):
+        # Approved decisions sign the approval state too, so a receipt issued while pending never verifies.
+        payload=canon([tenant,did,hash_,exp,policy_hash] + ([approval] if approval else []))
         return hmac.new(self.db.receipt_key,payload.encode(),hashlib.sha256).hexdigest()
 
     # ---- learning state ---------------------------------------------------
@@ -418,13 +425,17 @@ class RecGuard:
 
     # ---- serving ----------------------------------------------------------
 
-    def _admit(self, items, source, req, pol, allow, seen, reasons, rejections) -> int:
+    def _admit(self, items, source, req, pol, allow, seen, reasons, rejections, flags=None) -> int:
         dropped=0
         batch=set()
         for candidate in items:
             if source=="fallback" and candidate.item_id in seen and candidate.item_id not in batch:
                 continue  # already offered as a primary candidate; not a rejection
             reason=self._check(candidate,req,pol)
+            if isinstance(reason,Review):
+                if flags is not None and candidate.item_id not in seen:
+                    flags.setdefault(candidate.item_id,str(reason))
+                reason=None
             if reason is None and candidate.item_id in seen:
                 reason="DUPLICATE_ITEM"
             if reason:
@@ -434,7 +445,8 @@ class RecGuard:
                 allow.append(candidate);seen.add(candidate.item_id);batch.add(candidate.item_id)
         return dropped
 
-    def _apply_decision_checks(self, output:list[Candidate], req:Request, reasons:Counter, rejections:list) -> bool:
+    def _apply_decision_checks(self, output:list[Candidate], req:Request, reasons:Counter, rejections:list,
+                               reviews:list|None=None) -> bool:
         """Run whole-decision rules on the approved list in place. Returns True if anything was removed."""
         changed=False
         for name,(fn,mode) in self._decision_checks.items():
@@ -444,6 +456,10 @@ class RecGuard:
                 except Exception:
                     reason="CHECK_ERROR"
                 if reason is None:
+                    break
+                if isinstance(reason,Review):
+                    if reviews is not None:
+                        reviews.append(f"{name}:{reason}")
                     break
                 code=f"{name}:{reason}" if reason!="CHECK_ERROR" else f"CHECK_ERROR:{name}"
                 reasons[code]+=1
@@ -476,12 +492,13 @@ class RecGuard:
                 return report
             for item in output:
                 reason=self._check(item,req,pol,checks)
-                if reason:
+                if reason and not isinstance(reason,Review):
                     report.would_reject.append(Rejection(item_id=item.item_id,reason=reason,source="shadow"))
             for r in rejections:
                 if r.source=="candidates":
                     item=next((x for x in req.candidates if x.item_id==r.item_id),None)
-                    if item is not None and r.reason!="DUPLICATE_ITEM" and self._check(item,req,pol,checks) is None:
+                    if item is not None and r.reason!="DUPLICATE_ITEM" and (self._check(item,req,pol,checks) is None
+                                                                           or isinstance(self._check(item,req,pol,checks),Review)):
                         report.would_admit.append(item.item_id)
             kept=[x for x in output if x.item_id not in {r.item_id for r in report.would_reject}]
             for pack in self._shadow.values():
@@ -490,7 +507,7 @@ class RecGuard:
                         reason=fn(list(kept),req)
                     except Exception:
                         reason="CHECK_ERROR"
-                    if reason is not None:
+                    if reason is not None and not isinstance(reason,Review):
                         report.decision_violations.append(f"{name}:{reason}")
             return report
         except Exception as exc:  # shadow evaluation must never affect serving
@@ -519,14 +536,14 @@ class RecGuard:
         with self.db.tx() as c:
             enabled=self.serving_enabled(req.tenant_id)
             pol=self._policy(req.tenant_id,req.purpose) if enabled else None
-            reasons=Counter(); rejections=[]
+            reasons=Counter(); rejections=[]; flags={}; decision_reviews=[]
             allow=[]; seen=set(); output=[]; repaired=False
             strategy,prob="none",1.0
             all_count=len(req.candidates)+len(req.fallback_candidates)
             if not enabled:reasons["SERVING_DISABLED"]+=1
             if pol:
                 cap=min(req.k,pol.max_results)
-                repaired=self._admit(req.candidates,"candidates",req,pol,allow,seen,reasons,rejections)>0
+                repaired=self._admit(req.candidates,"candidates",req,pol,allow,seen,reasons,rejections,flags)>0
                 if pol.min_results>cap:
                     reasons["IMPOSSIBLE_RESULT_MINIMUM"]+=1
                 elif allow or req.fallback_candidates:
@@ -538,11 +555,11 @@ class RecGuard:
                                          reasons,rejections,"candidates")>0
                     if len(output)<cap and req.fallback_candidates:
                         backup=[]
-                        self._admit(req.fallback_candidates,"fallback",req,pol,backup,seen,reasons,rejections)
+                        self._admit(req.fallback_candidates,"fallback",req,pol,backup,seen,reasons,rejections,flags)
                         before=len(output)
                         self._fill(output,self._rank(backup,"base",len(backup)),cap,pol.max_per_category,reasons,rejections,"fallback")
                         repaired|=len(output)>before
-                    repaired|=self._apply_decision_checks(output,req,reasons,rejections)
+                    repaired|=self._apply_decision_checks(output,req,reasons,rejections,decision_reviews)
                     if len(output)<pol.min_results:output=[]
             elif enabled:
                 reasons["NO_APPLICABLE_POLICY"]+=1
@@ -552,6 +569,17 @@ class RecGuard:
             else:
                 # Truncating to k or reordering is normal ranking, not a repair.
                 status=DecisionState.REPAIRED if repaired else DecisionState.PASS
+            review_items=[ReviewItem(item_id=x.item_id,reason=flags[x.item_id]) for x in output if x.item_id in flags]
+            review_items+=[ReviewItem(item_id=None,reason=r) for r in decision_reviews]
+            if output and pol is not None and pol.require_approval:
+                review_items.append(ReviewItem(item_id=None,reason="POLICY_REQUIRES_APPROVAL"))
+            base_status=status
+            if output and review_items:
+                status=DecisionState.PENDING_APPROVAL
+                for item in review_items:
+                    reasons[f"REVIEW:{item.reason}"]+=1
+            else:
+                review_items=[]
             shadow=self._shadow_verdict(req,output,rejections) if self._shadow and enabled else None
             shadow_row={} if shadow is None else {"reject":dict(Counter(r.reason for r in shadow.would_reject)),
                         "admit":len(shadow.would_admit),"decision":shadow.decision_violations,"error":shadow.error}
@@ -561,12 +589,52 @@ class RecGuard:
             oh=self._hash_results(output)
             sig=self._signature(req.tenant_id,did,oh,exp,fp)
             codes=sorted(reasons)
-            c.execute("""INSERT INTO decisions(id,tenant,request_id,purpose,segment,strategy,propensity,policy_hash,status,output_hash,receipt,exp,at,candidate_count,eligible_count,reasons,shadow)
-                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(did,req.tenant_id,req.request_id,req.purpose,req.segment,strategy,prob,fp,status.value,oh,sig,exp,time.time(),all_count,len(seen),canon(codes),canon({"evaluated":1,**{k:v for k,v in shadow_row.items() if v}} if shadow is not None else {})))
+            pending=status==DecisionState.PENDING_APPROVAL
+            review_row={"base_status":base_status.value,"items":[r.model_dump() for r in review_items],
+                        "results":[x.model_dump(mode="json") for x in output]} if pending else []
+            c.execute("""INSERT INTO decisions(id,tenant,request_id,purpose,segment,strategy,propensity,policy_hash,status,output_hash,receipt,exp,at,candidate_count,eligible_count,reasons,shadow,approval,reviews)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(did,req.tenant_id,req.request_id,req.purpose,req.segment,strategy,prob,fp,status.value,oh,sig,exp,time.time(),all_count,len(seen),canon(codes),canon({"evaluated":1,**{k:v for k,v in shadow_row.items() if v}} if shadow is not None else {}),
+                         "pending" if pending else None,canon(review_row)))
             self.db.audit(req.tenant_id,"DECISION",{"decision_id":did,"request_id":req.request_id,"status":status.value,"policy_fingerprint":fp,"reason_codes":codes,"strategy":strategy,"candidate_count":all_count,"eligible_count":len(seen),"result_count":len(output)})
         return Decision(decision_id=did,request_id=req.request_id,tenant_id=req.tenant_id,status=status,results=output,
                         strategy=strategy,propensity=prob,policy_fingerprint=fp,reason_codes=codes,receipt=sig,expires_at=exp,
-                        rejections=rejections,shadow=shadow)
+                        rejections=rejections,shadow=shadow,review_required=review_items)
+
+    def pending_reviews(self, tenant:str) -> list[dict]:
+        """Decisions waiting for a human: what was approved by policy and why review is needed."""
+        with self.db.tx() as c:
+            rows=c.execute("SELECT id,request_id,purpose,at,reviews FROM decisions WHERE tenant=? AND approval='pending' ORDER BY at",(tenant,)).fetchall()
+        out=[]
+        for row in rows:
+            data=json.loads(row["reviews"])
+            out.append({"decision_id":row["id"],"request_id":row["request_id"],"purpose":row["purpose"],"at":row["at"],
+                        "review_required":data["items"],"results":data["results"]})
+        return out
+
+    def review(self, tenant:str, decision_id:str, approve:bool, reviewer:str, note:str="") -> dict:
+        """Approve (issues a fresh receipt) or reject a PENDING_APPROVAL decision. Audited with the reviewer."""
+        if not reviewer:
+            raise Denied("REVIEWER_REQUIRED")
+        with self.db.tx() as c:
+            row=c.execute("SELECT * FROM decisions WHERE id=? AND tenant=?",(decision_id,tenant)).fetchone()
+            if not row or row["approval"]!="pending":
+                raise Denied("NOT_PENDING_APPROVAL")
+            if approve:
+                if not self.serving_enabled(tenant):
+                    raise Denied("SERVING_DISABLED")
+                current=self._policy(tenant,row["purpose"])
+                if current is None or current.fingerprint!=row["policy_hash"]:
+                    raise Denied("POLICY_CHANGED_SINCE_DECISION")
+                status=json.loads(row["reviews"])["base_status"]
+                exp=int(time.time())+self.receipt_ttl
+                sig=self._signature(tenant,decision_id,row["output_hash"],exp,row["policy_hash"],approval="approved")
+                c.execute("UPDATE decisions SET approval='approved',reviewer=?,status=?,exp=?,receipt=? WHERE id=?",
+                          (reviewer,status,exp,sig,decision_id))
+            else:
+                status,exp,sig="BLOCKED",None,None
+                c.execute("UPDATE decisions SET approval='rejected',reviewer=?,status='BLOCKED' WHERE id=?",(reviewer,decision_id))
+            self.db.audit(tenant,"DECISION_REVIEWED",{"decision_id":decision_id,"approved":approve,"reviewer":reviewer,"note":note[:500]})
+        return {"decision_id":decision_id,"status":status,"receipt":sig,"expires_at":exp}
 
     def evaluate_many(self, requests:list[Request]) -> list[Decision]:
         return [self.evaluate(r) for r in requests]
@@ -575,14 +643,15 @@ class RecGuard:
         if not isinstance(receipt,str) or not HEX64.match(receipt):return False
         with self.db.tx() as c:
             row=c.execute("SELECT * FROM decisions WHERE id=? AND tenant=?",(did,tenant)).fetchone()
-            if not row or row["status"]=="BLOCKED" or row["exp"]<time.time():return False
+            if not row or row["status"] in ("BLOCKED","PENDING_APPROVAL") or row["exp"]<time.time():return False
+            if row["approval"] in ("pending","rejected"):return False
             if not self.serving_enabled(tenant):return False
             current=self._policy(tenant,row["purpose"])
         if current is None or current.fingerprint != row["policy_hash"]:return False
         if len(results)!=len({x.item_id for x in results}):return False
         if any(x.tenant_id!=tenant for x in results):return False
         item_hash=self._hash_results(results)
-        sig=self._signature(tenant,did,item_hash,row["exp"],row["policy_hash"])
+        sig=self._signature(tenant,did,item_hash,row["exp"],row["policy_hash"],approval=row["approval"])
         return hmac.compare_digest(sig,receipt) and hmac.compare_digest(sig,row["receipt"]) and item_hash==row["output_hash"]
 
     def presented(self,tenant:str,did:str,receipt:str,results:list[Candidate]):

@@ -27,8 +27,8 @@ import ast, csv, hashlib, io, json, math, operator, os, re, urllib.request
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Literal
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
-from .contracts import ID, Candidate, Policy, Request
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from .contracts import ID, Candidate, Policy, Request, Review
 from .storage import canon
 
 REASON = r"^[A-Za-z0-9][A-Za-z0-9_.:\-]*$"
@@ -64,10 +64,19 @@ class SourceSpec(BaseModel):
 
 
 class Rule(BaseModel):
+    """`reject: REASON` removes the item (first match wins); `review: REASON` keeps it but
+    holds the decision for human approval (all reject rules are still evaluated)."""
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-    reject: str = Field(pattern=REASON, max_length=96)
+    reject: str | None = Field(default=None, pattern=REASON, max_length=96)
+    review: str | None = Field(default=None, pattern=REASON, max_length=96)
     if_: str = Field(alias="if", max_length=MAX_EXPRESSION)
     unless: str | None = Field(default=None, max_length=MAX_EXPRESSION)
+
+    @model_validator(mode="after")
+    def one_outcome(self):
+        if (self.reject is None) == (self.review is None):
+            raise ValueError("a rule needs exactly one of `reject` or `review`")
+        return self
 
 
 class CheckSpec(BaseModel):
@@ -669,7 +678,7 @@ def _compile_check(pack: PolicyPack, spec, env: dict, static_only: bool = False,
 
     lets = {name: compile_expr(expr, f"let.{name}") for name, expr in spec.let.items()}
     applies = compile_expr(spec.applies_when, "applies_when") if spec.applies_when else None
-    rules = [(r.reject, compile_expr(r.if_, f"rules[{i}].if"), compile_expr(r.unless, f"rules[{i}].unless") if r.unless else None)
+    rules = [(r.reject, r.review, compile_expr(r.if_, f"rules[{i}].if"), compile_expr(r.unless, f"rules[{i}].unless") if r.unless else None)
              for i, r in enumerate(spec.rules)]
     if static_only:
         return None
@@ -687,10 +696,13 @@ def _compile_check(pack: PolicyPack, spec, env: dict, static_only: bool = False,
             if match is None:
                 return spec.on_unparseable
             root.update({k: _number(v) if v is not None else None for k, v in match.groupdict().items()})
-        for reason, cond, unless in rules:
+        flagged = None
+        for reject, review, cond, unless in rules:
             if cond(root, budget) and not (unless is not None and unless(root, budget)):
-                return reason
-        return None
+                if reject is not None:
+                    return reject
+                flagged = flagged or Review(review)
+        return flagged
 
     check.__name__ = f"pack_check_{spec.name}"
     check.__doc__ = spec.description or f"{spec.name} from policy pack {pack.name}"

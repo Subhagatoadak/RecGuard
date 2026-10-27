@@ -17,12 +17,13 @@ class RecGuardError(PermissionError):
 
 class RecGuardClient:
     def __init__(self,base_url:str,serve_token:str,present_token:str|None=None,outcome_token:str|None=None,
-                 telemetry_token:str|None=None,timeout:float=5):
+                 telemetry_token:str|None=None,timeout:float=5,review_token:str|None=None):
         self.url=base_url.rstrip('/')
         self.serve_token=serve_token
         self.present_token=present_token
         self.outcome_token=outcome_token
         self.telemetry_token=telemetry_token
+        self.review_token=review_token
         self.timeout=timeout
 
     def _call(self,method:str,path:str,token:str|None,data:dict|None=None):
@@ -44,10 +45,14 @@ class RecGuardClient:
         return self._call('POST',path,token,data)
 
     def guard(self, request:Request) -> dict:
-        """Host MUST use only `results` returned from gateway; fail closed on error."""
+        """Host MUST use only `results` returned from gateway; fail closed on error.
+
+        PENDING_APPROVAL raises too: show nothing until a reviewer approves (see `review`)."""
         result=self._post('/v1/recommendations/evaluate',request.model_dump(mode='json'),self.serve_token)
         if result['status']=='BLOCKED':
             raise RecGuardError('RECGUARD_BLOCKED: '+','.join(result['reason_codes']))
+        if result['status']=='PENDING_APPROVAL':
+            raise RecGuardError('RECGUARD_PENDING_APPROVAL: '+result['decision_id'])
         if not self.verify(result,request.tenant_id):
             raise RecGuardError('RECGUARD_VERIFICATION_FAILED')
         return result
@@ -78,6 +83,14 @@ class RecGuardClient:
         """Content-free telemetry: latency_ms, token_count, cost_usd only."""
         return self._post('/v1/telemetry/events',{'tenant_id':tenant_id,'event_type':event_type,
             'event_id':event_id or uuid.uuid4().hex,'decision_id':decision_id,**measures},self.telemetry_token)
+
+
+    def pending_reviews(self,tenant_id:str) -> list[dict]:
+        return self._call('GET',f'/v1/reviews/{tenant_id}',self.review_token)['pending']
+
+    def review(self,tenant_id:str,decision_id:str,approve:bool,note:str='') -> dict:
+        """Approve (returns a fresh receipt) or reject a PENDING_APPROVAL decision."""
+        return self._post('/v1/reviews',{'tenant_id':tenant_id,'decision_id':decision_id,'approve':approve,'note':note},self.review_token)
 
 
 def wrap_recommender(model_fn:Callable,client:RecGuardClient,tenant_id:str,purpose:str,**base):

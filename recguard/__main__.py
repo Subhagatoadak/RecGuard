@@ -8,6 +8,7 @@ DEV_SCOPES={
     'event':['telemetry:write'],
     'outcome':['outcomes:write'],
     'learner':['learning:admin'],
+    'reviewer':['decisions:review'],
     'data':['data:admin'],
     'policy':['policy:write','policy:read'],
 }
