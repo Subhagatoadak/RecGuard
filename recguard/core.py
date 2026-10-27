@@ -57,6 +57,7 @@ class RecGuard:
         self._shadow: dict[str, dict] = {}  # pack name -> {"policies", "checks", "decision_checks"}; reported, never enforced
         self._packs: dict[str, dict] = {}   # pack name -> how it was loaded, for refresh and listing
         self._default_refresh: float | None = None  # set by start_auto_refresh; applies to packs without their own
+        self._trusted_pack_keys: dict | None = None  # key_id -> Ed25519 public key; when set, packs must be signed
         self._strategies: dict[str, tuple[Strategy, bool]] = {}
 
     # ---- extension points -------------------------------------------------
@@ -150,7 +151,14 @@ class RecGuard:
         self._check_digests.pop(name, None)
         self._check_packs.pop(name, None)
 
-    def _load_policy_pack_impl(self, source, context: dict | None = None, data_version: str | None = None, _prefetched=None) -> dict:
+    def trust_pack_keys(self, public_key_paths) -> list[str]:
+        """Require every policy pack loaded from now on to carry a valid signature from one of these keys."""
+        from .signing import load_public_keys
+        self._trusted_pack_keys = {**(self._trusted_pack_keys or {}), **load_public_keys(public_key_paths)}
+        return sorted(self._trusted_pack_keys)
+
+    def _load_policy_pack_impl(self, source, context: dict | None = None, data_version: str | None = None, _prefetched=None,
+                               signature=None) -> dict:
         """Register a YAML/JSON policy pack: its policies (monotonic versions) and declarative checks.
 
         `context` supplies the host data the pack declares (catalogs, model outputs, helper
@@ -161,6 +169,10 @@ class RecGuard:
         `sources:` the host doesn't supply are fetched; their content hash joins the data version.
         """
         pack = source if isinstance(source, PolicyPack) else load_pack(source)
+        signed_by = None
+        if self._trusted_pack_keys is not None:
+            from .signing import verify_pack
+            signed_by = verify_pack(pack, signature, self._trusted_pack_keys)["key_id"]
         host_context = dict(context or {})
         fetched, source_hash = _prefetched or fetch_sources(pack, skip=host_context)
         effective_version = data_version
@@ -184,7 +196,7 @@ class RecGuard:
             with self.db.tx():
                 self._shadow[pack.name] = {"policies": list(pack.policies), "checks": compiled,
                                            "decision_checks": {s.name: (compiled_decisions[s.name], s.on_violation) for s in pack.decision_checks}}
-                summary = {"pack": pack.name, "mode": "shadow", "digest": pack.digest, "data_version": data_version,
+                summary = {"pack": pack.name, "mode": "shadow", "digest": pack.digest, "data_version": data_version, "signed_by": signed_by,
                            "policies": [f"{p.policy_id}@v{p.version}" for p in pack.policies],
                            "checks": list(compiled), "decision_checks": list(compiled_decisions)}
                 self.db.audit("*", "POLICY_PACK_SHADOWED", summary)
@@ -218,7 +230,8 @@ class RecGuard:
                     digest=hashlib.sha256(f"{digest}:{data_version}".encode()).hexdigest()
                 self.register_decision_check(spec.name, compiled_decisions[spec.name], spec.on_violation, digest=digest)
                 self._check_packs[spec.name] = pack.name
-            summary = {"pack": pack.name, "mode": "enforce", "digest": pack.digest, "data_version": data_version, "policies_registered": registered,
+            summary = {"pack": pack.name, "mode": "enforce", "digest": pack.digest, "data_version": data_version, "signed_by": signed_by,
+                       "policies_registered": registered,
                        "policies_unchanged": unchanged, "checks": [c.name for c in pack.checks],
                        "decision_checks": [c.name for c in pack.decision_checks]}
             self.db.audit("*", "POLICY_PACK_LOADED", summary)
@@ -672,9 +685,10 @@ class RecGuard:
         with span("recguard.review", tenant=tenant, approved=approve):
             return self._review_impl(tenant,decision_id,approve,reviewer,note)
 
-    def load_policy_pack(self, source, context: dict | None = None, data_version: str | None = None, _prefetched=None) -> dict:
+    def load_policy_pack(self, source, context: dict | None = None, data_version: str | None = None, _prefetched=None,
+                         signature=None) -> dict:
         with span("recguard.load_policy_pack") as s:
-            summary=self._load_policy_pack_impl(source,context,data_version,_prefetched)
+            summary=self._load_policy_pack_impl(source,context,data_version,_prefetched,signature)
             set_attributes(s, pack=summary["pack"], mode=summary["mode"], checks=len(summary["checks"]),
                            decision_checks=len(summary.get("decision_checks",[])))
             return summary

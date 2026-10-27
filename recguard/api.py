@@ -272,6 +272,9 @@ def from_environment():
         raise RuntimeError('Set RECGUARD_TOKENS_JSON (or RECGUARD_OIDC_ISSUER) and a strong RECGUARD_SIGNING_KEY (min 32 bytes). Fail-closed startup.')
     ttl=int(os.getenv('RECGUARD_RECEIPT_TTL','300'))
     engine=RecGuard(os.getenv('RECGUARD_DB','recguard.db'),signing.encode(),receipt_ttl=ttl)
+    keys=[x.strip() for x in os.getenv('RECGUARD_POLICY_PUBLIC_KEYS','').split(',') if x.strip()]
+    if keys:
+        engine.trust_pack_keys(keys)  # only governance-signed packs load (startup and hot reload)
     # Policy-as-code: comma-separated YAML/JSON packs loaded at startup. Packs that declare
     # `context:` need host data and can only be loaded by an embedding application.
     for path in filter(None,(x.strip() for x in os.getenv('RECGUARD_POLICY_PACKS','').split(','))):

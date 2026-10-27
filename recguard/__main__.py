@@ -55,6 +55,12 @@ def main(argv=None):
     sh=psub.add_parser('show',help='print the resolved pack (includes merged) as JSON')
     sh.add_argument('file')
     psub.add_parser('schema',help='print the JSON Schema for policy packs (for editor autocompletion)')
+    kg=psub.add_parser('keygen',help='create an Ed25519 signing key pair: <prefix>.key and <prefix>.pub')
+    kg.add_argument('prefix')
+    sg=psub.add_parser('sign',help='sign a pack (writes <pack>.sig)')
+    sg.add_argument('file');sg.add_argument('--key',required=True);sg.add_argument('--signer',default='')
+    vf=psub.add_parser('verify',help='check a pack signature against trusted public keys')
+    vf.add_argument('file');vf.add_argument('--pub',required=True,action='append')
     args=parser.parse_args(argv)
     if args.cmd=='dev-env':
         dev_env(args.tenant,args.env_file)
@@ -66,6 +72,20 @@ def main(argv=None):
         from .policy_pack import PackError, PolicyPack, load_pack
         if args.policy_cmd=='schema':
             print(json.dumps(PolicyPack.model_json_schema(by_alias=True),indent=2));return
+        if args.policy_cmd in ('keygen','sign','verify'):
+            from . import signing
+            try:
+                if args.policy_cmd=='keygen':
+                    private,public=signing.generate_keypair(args.prefix)
+                    print(f'✓ wrote {private} (keep secret) and {public} (key id {signing.key_id(signing.load_public_keys([public]).popitem()[1])})')
+                elif args.policy_cmd=='sign':
+                    print(f'✓ wrote {signing.sign_pack(args.file,args.key,args.signer)}')
+                else:
+                    record=signing.verify_pack(load_pack(args.file),None,signing.load_public_keys(args.pub))
+                    print(f'✓ {args.file}: signed by key {record["key_id"]} {record.get("signer") or ""} at {record["signed_at"]}')
+            except (PackError,OSError,ValueError) as exc:
+                print(f'✗ {exc}',file=sys.stderr);sys.exit(1)
+            return
         files=args.files if args.policy_cmd=='validate' else [args.file]
         failed=False
         for path in files:
