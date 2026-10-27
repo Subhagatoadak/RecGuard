@@ -160,7 +160,7 @@ class ServingUpdate(Strict):
 class TokenGrant(Strict):
     tenant_id: ID | Literal["*"]
     scopes: list[ID] = Field(min_length=1)
-    subject: ID | None = None  # who holds the token (recorded as the reviewer on approvals)
+    subject: str | None = Field(default=None, max_length=160, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:@\-]*$")  # recorded as the reviewer
 
 class ReviewDecision(Strict):
     tenant_id: ID

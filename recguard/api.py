@@ -14,9 +14,11 @@ from .contracts import (Request, BatchRequest, PolicyRegistration, Telemetry, Ou
 from .core import RecGuard, Denied
 
 class ScopeAuth:
-    def __init__(self, mapping: dict):
-        if not isinstance(mapping, dict) or not mapping or any(not isinstance(k, str) or len(k) < 24 for k in mapping):
-            raise ValueError("RECGUARD_TOKENS_JSON requires nonempty tokens >=24 characters")
+    def __init__(self, mapping: dict, oidc=None):
+        self.oidc = oidc
+        mapping = mapping or {}
+        if not isinstance(mapping, dict) or (not mapping and oidc is None) or any(not isinstance(k, str) or len(k) < 24 for k in mapping):
+            raise ValueError("RECGUARD_TOKENS_JSON requires nonempty tokens >=24 characters (or configure OIDC)")
         try:
             grants = {k: TokenGrant.model_validate(v) for k, v in mapping.items()}
         except ValidationError as exc:
@@ -27,7 +29,13 @@ class ScopeAuth:
     def require(self,authorization:str|None,scope:str,tenant:str) -> TokenGrant:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(401,"missing bearer token")
-        token=self._registry.get(hashlib.sha256(authorization[7:].encode()).hexdigest())
+        raw=authorization[7:]
+        token=self._registry.get(hashlib.sha256(raw.encode()).hexdigest())
+        if token is None and self.oidc is not None and raw.count(".")==2:
+            try:
+                token=self.oidc.grant(raw)
+            except ValueError as exc:
+                raise HTTPException(401,str(exc)) from None
         if not token:
             raise HTTPException(401,"invalid bearer token")
         if token.tenant_id!=tenant or scope not in token.scopes:
@@ -80,8 +88,8 @@ class TenantRequest(BaseModel):
     tenant_id: ID  # extra fields (e.g. legacy `strategy`) are ignored
 
 
-def create_app(engine:RecGuard,token_mapping:dict,max_body_bytes:int=1_000_000)->FastAPI:
-    auth=ScopeAuth(token_mapping)
+def create_app(engine:RecGuard,token_mapping:dict|None,max_body_bytes:int=1_000_000,oidc=None)->FastAPI:
+    auth=ScopeAuth(token_mapping,oidc)
     app=FastAPI(title="RecGuard control, serving, and telemetry API",version="0.3.0")
     app.add_middleware(BodyLimit,limit=max_body_bytes)
 
@@ -256,10 +264,12 @@ def create_app(engine:RecGuard,token_mapping:dict,max_body_bytes:int=1_000_000)-
 
 
 def from_environment():
+    from .oidc import OIDCAuth
     tokens=os.environ.get('RECGUARD_TOKENS_JSON')
     signing=os.environ.get('RECGUARD_SIGNING_KEY')
-    if not tokens or not signing or len(signing.encode())<32:
-        raise RuntimeError('Set RECGUARD_TOKENS_JSON and a strong RECGUARD_SIGNING_KEY (min 32 bytes). Fail-closed startup.')
+    oidc=OIDCAuth.from_environment()
+    if (not tokens and oidc is None) or not signing or len(signing.encode())<32:
+        raise RuntimeError('Set RECGUARD_TOKENS_JSON (or RECGUARD_OIDC_ISSUER) and a strong RECGUARD_SIGNING_KEY (min 32 bytes). Fail-closed startup.')
     ttl=int(os.getenv('RECGUARD_RECEIPT_TTL','300'))
     engine=RecGuard(os.getenv('RECGUARD_DB','recguard.db'),signing.encode(),receipt_ttl=ttl)
     # Policy-as-code: comma-separated YAML/JSON packs loaded at startup. Packs that declare
@@ -273,7 +283,7 @@ def from_environment():
         interval=min(due) if due else 0
     if interval:
         engine.start_auto_refresh(interval)
-    return create_app(engine,json.loads(tokens),max_body_bytes=int(os.getenv('RECGUARD_MAX_BODY_BYTES','1000000')))
+    return create_app(engine,json.loads(tokens) if tokens else {},max_body_bytes=int(os.getenv('RECGUARD_MAX_BODY_BYTES','1000000')),oidc=oidc)
 
 # Secure-by-default: no default bearer tokens or signing keys.
 # Use `uvicorn recguard.api:from_environment --factory` (or `recguard serve`) to start.
