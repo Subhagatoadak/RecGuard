@@ -3,7 +3,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY pyproject.toml README.md /app/
 COPY recguard /app/recguard
-RUN pip install --no-cache-dir ".[server,yaml,postgres,oidc]" && \
+RUN pip install --no-cache-dir ".[server,yaml,postgres,oidc,otel]" && \
     groupadd --system rg && useradd --system --gid rg --home /app rg && \
     mkdir -p /var/lib/recguard && chown rg:rg /var/lib/recguard
 USER rg

@@ -283,7 +283,10 @@ def from_environment():
         interval=min(due) if due else 0
     if interval:
         engine.start_auto_refresh(interval)
-    return create_app(engine,json.loads(tokens) if tokens else {},max_body_bytes=int(os.getenv('RECGUARD_MAX_BODY_BYTES','1000000')),oidc=oidc)
+    app=create_app(engine,json.loads(tokens) if tokens else {},max_body_bytes=int(os.getenv('RECGUARD_MAX_BODY_BYTES','1000000')),oidc=oidc)
+    from .tracing import configure_from_environment
+    configure_from_environment(app)
+    return app
 
 # Secure-by-default: no default bearer tokens or signing keys.
 # Use `uvicorn recguard.api:from_environment --factory` (or `recguard serve`) to start.

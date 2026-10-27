@@ -8,6 +8,7 @@ from .contracts import Candidate, Decision, DecisionState, Outcome, Policy, Reje
 from .storage import canon, open_store
 from . import learning
 from .policy_pack import PolicyPack, fetch_sources, load_pack
+from .tracing import set_attributes, span
 
 Check = Callable[[Candidate, Request], "str | None"]
 DecisionCheck = Callable[[list[Candidate], Request], "str | None"]
@@ -100,7 +101,7 @@ class RecGuard:
                  "max_age_seconds": info["state"]["max_age"], "last_error": info["last_error"]}
                 for name, info in sorted(self._packs.items())]
 
-    def refresh_policy_packs(self, force: bool = False) -> list[dict]:
+    def _refresh_policy_packs_impl(self, force: bool = False) -> list[dict]:
         """Re-read pack files and re-fetch sources that are due (or all, with `force`).
 
         A pack is reloaded only when its rules or data changed; a failed refresh keeps the
@@ -149,7 +150,7 @@ class RecGuard:
         self._check_digests.pop(name, None)
         self._check_packs.pop(name, None)
 
-    def load_policy_pack(self, source, context: dict | None = None, data_version: str | None = None, _prefetched=None) -> dict:
+    def _load_policy_pack_impl(self, source, context: dict | None = None, data_version: str | None = None, _prefetched=None) -> dict:
         """Register a YAML/JSON policy pack: its policies (monotonic versions) and declarative checks.
 
         `context` supplies the host data the pack declares (catalogs, model outputs, helper
@@ -532,7 +533,7 @@ class RecGuard:
                 "would_reject_items":dict(reject),"would_admit_items":admit,"decision_violations":dict(decision),
                 "errors":errors}
 
-    def evaluate(self,req:Request)->Decision:
+    def _evaluate_impl(self,req:Request)->Decision:
         # One transaction: kill switch, policy, strategy and the logged decision are consistent.
         with self.db.tx() as c:
             enabled=self.serving_enabled(req.tenant_id)
@@ -612,7 +613,7 @@ class RecGuard:
                         "review_required":data["items"],"results":data["results"]})
         return out
 
-    def review(self, tenant:str, decision_id:str, approve:bool, reviewer:str, note:str="") -> dict:
+    def _review_impl(self, tenant:str, decision_id:str, approve:bool, reviewer:str, note:str="") -> dict:
         """Approve (issues a fresh receipt) or reject a PENDING_APPROVAL decision. Audited with the reviewer."""
         if not reviewer:
             raise Denied("REVIEWER_REQUIRED")
@@ -637,10 +638,57 @@ class RecGuard:
             self.db.audit(tenant,"DECISION_REVIEWED",{"decision_id":decision_id,"approved":approve,"reviewer":reviewer,"note":note[:500]})
         return {"decision_id":decision_id,"status":status,"receipt":sig,"expires_at":exp}
 
+    # ---- traced public entry points (content-free span attributes) -----------------
+
+    def evaluate(self, req:Request) -> Decision:
+        with span("recguard.evaluate", tenant=req.tenant_id, purpose=req.purpose, k=req.k,
+                  candidates=len(req.candidates), fallback_candidates=len(req.fallback_candidates)) as s:
+            d=self._evaluate_impl(req)
+            set_attributes(s, status=d.status.value, results=len(d.results), rejected=len(d.rejections),
+                           strategy=d.strategy, reason_codes=list(d.reason_codes), policy_fingerprint=d.policy_fingerprint[:16],
+                           review_required=len(d.review_required),
+                           shadow_would_reject=len(d.shadow.would_reject) if d.shadow else None)
+            return d
+
+    def verify(self, tenant:str, did:str, receipt:str, results:list[Candidate]) -> bool:
+        with span("recguard.verify", tenant=tenant, results=len(results)) as s:
+            valid=self._verify_impl(tenant,did,receipt,results)
+            set_attributes(s, valid=valid)
+            return valid
+
+    def presented(self, tenant:str, did:str, receipt:str, results:list[Candidate]):
+        with span("recguard.presented", tenant=tenant, results=len(results)):
+            return self._presented_impl(tenant,did,receipt,results)
+
+    def outcome(self, outcome:Outcome):
+        with span("recguard.outcome", tenant=outcome.tenant_id, outcome_type=outcome.outcome_type.value):
+            return self._outcome_impl(outcome)
+
+    def event(self, event:Telemetry):
+        with span("recguard.event", tenant=event.tenant_id, event_type=event.event_type.value):
+            return self._event_impl(event)
+
+    def review(self, tenant:str, decision_id:str, approve:bool, reviewer:str, note:str="") -> dict:
+        with span("recguard.review", tenant=tenant, approved=approve):
+            return self._review_impl(tenant,decision_id,approve,reviewer,note)
+
+    def load_policy_pack(self, source, context: dict | None = None, data_version: str | None = None, _prefetched=None) -> dict:
+        with span("recguard.load_policy_pack") as s:
+            summary=self._load_policy_pack_impl(source,context,data_version,_prefetched)
+            set_attributes(s, pack=summary["pack"], mode=summary["mode"], checks=len(summary["checks"]),
+                           decision_checks=len(summary.get("decision_checks",[])))
+            return summary
+
+    def refresh_policy_packs(self, force: bool = False) -> list[dict]:
+        with span("recguard.refresh_policy_packs", force=force) as s:
+            results=self._refresh_policy_packs_impl(force)
+            set_attributes(s, changed=sum(1 for r in results if r.get("changed")), errors=sum(1 for r in results if "error" in r))
+            return results
+
     def evaluate_many(self, requests:list[Request]) -> list[Decision]:
         return [self.evaluate(r) for r in requests]
 
-    def verify(self,tenant:str,did:str,receipt:str,results:list[Candidate])->bool:
+    def _verify_impl(self,tenant:str,did:str,receipt:str,results:list[Candidate])->bool:
         if not isinstance(receipt,str) or not HEX64.match(receipt):return False
         with self.db.tx() as c:
             row=c.execute("SELECT * FROM decisions WHERE id=? AND tenant=?",(did,tenant)).fetchone()
@@ -655,13 +703,13 @@ class RecGuard:
         sig=self._signature(tenant,did,item_hash,row["exp"],row["policy_hash"],approval=row["approval"])
         return hmac.compare_digest(sig,receipt) and hmac.compare_digest(sig,row["receipt"]) and item_hash==row["output_hash"]
 
-    def presented(self,tenant:str,did:str,receipt:str,results:list[Candidate]):
+    def _presented_impl(self,tenant:str,did:str,receipt:str,results:list[Candidate]):
         with self.db.tx() as c:
             if not self.verify(tenant,did,receipt,results):raise Denied("RECEIPT_MISMATCH_OR_EXPIRED")
             if c.execute("INSERT OR IGNORE INTO presentations(decision_id,tenant,at) VALUES(?,?,?)",(did,tenant,time.time())).rowcount:
                 self.db.audit(tenant,"PRESENTED",{"decision_id":did,"item_count":len(results)})
 
-    def event(self,event:Telemetry):
+    def _event_impl(self,event:Telemetry):
         with self.db.tx() as c:
             if event.decision_id:
                 dec=c.execute("SELECT tenant FROM decisions WHERE id=?",(event.decision_id,)).fetchone()
@@ -672,7 +720,7 @@ class RecGuard:
                 raise Denied("DUPLICATE_EVENT")
             self.db.audit(event.tenant_id,"TELEMETRY",{"event_id":event.event_id,"kind":event.event_type.value,"decision_id":event.decision_id})
 
-    def outcome(self,outcome:Outcome):
+    def _outcome_impl(self,outcome:Outcome):
         with self.db.tx() as c:
             d=c.execute("""SELECT d.* FROM decisions d JOIN presentations p ON d.id=p.decision_id
                            WHERE d.id=? AND d.tenant=?""",(outcome.decision_id,outcome.tenant_id)).fetchone()
