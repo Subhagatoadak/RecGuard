@@ -1,0 +1,8 @@
+# A release gate that admits everything. Loading it still changes the policy fingerprint,
+# which invalidates receipts issued under the previous rule set.
+recguard: 1
+name: mmm-release-review
+checks:
+  - name: release-review-v2
+    rules:
+      - {reject: RELEASE_REVIEW_PENDING, if: "False"}

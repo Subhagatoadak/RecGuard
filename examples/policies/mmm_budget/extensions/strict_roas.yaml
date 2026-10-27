@@ -1,0 +1,9 @@
+# Drop-in extension: deliberately strict, to demonstrate abstention.
+recguard: 1
+name: mmm-strict-roas
+context: [FORECASTS]
+constants: {strict_roas_floor: 10.0}
+checks:
+  - name: strict-roas-v1
+    rules:
+      - {reject: STRICT_ROAS_FLOOR, if: "FORECASTS[item.item_id].lower_roas < strict_roas_floor"}

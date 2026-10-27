@@ -59,6 +59,7 @@ class Policy(Strict):
     denied_item_ids: list[ID] = Field(default_factory=list, max_length=10_000)
     min_score: float | None = None
     max_per_category: int | None = Field(default=None, ge=1, le=50)  # exposure/diversity cap per category
+    enabled: bool = True  # retire a policy by registering a new version with enabled: false
 
     @field_validator("min_score")
     @classmethod

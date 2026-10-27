@@ -34,6 +34,44 @@ class ScopeAuth:
             raise HTTPException(403,"tenant or scope mismatch")
         return token
 
+class BodyLimit:
+    """ASGI middleware: reject request bodies over `limit` bytes with 413 (declared or streamed)."""
+
+    def __init__(self, app, limit: int):
+        self.app, self.limit = app, limit
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        declared = dict(scope.get("headers") or []).get(b"content-length")
+        if declared is not None and (not declared.isdigit() or int(declared) > self.limit):
+            return await self._reject(send)
+        seen = 0
+
+        async def limited():
+            nonlocal seen
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > self.limit:
+                    raise _TooLarge()
+            return message
+
+        try:
+            await self.app(scope, limited, send)
+        except _TooLarge:
+            await self._reject(send)
+
+    @staticmethod
+    async def _reject(send):
+        await send({"type": "http.response.start", "status": 413, "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": b'{"detail":"request body too large"}'})
+
+
+class _TooLarge(Exception):
+    pass
+
+
 class StrategyRequest(BaseModel):
     tenant_id: ID
     strategy: ID
@@ -42,9 +80,10 @@ class TenantRequest(BaseModel):
     tenant_id: ID  # extra fields (e.g. legacy `strategy`) are ignored
 
 
-def create_app(engine:RecGuard,token_mapping:dict)->FastAPI:
+def create_app(engine:RecGuard,token_mapping:dict,max_body_bytes:int=1_000_000)->FastAPI:
     auth=ScopeAuth(token_mapping)
-    app=FastAPI(title="RecGuard control, serving, and telemetry API",version="0.2.0")
+    app=FastAPI(title="RecGuard control, serving, and telemetry API",version="0.3.0")
+    app.add_middleware(BodyLimit,limit=max_body_bytes)
 
     def authorize(authorization:str|None,tenant:str,scope:str):
         auth.require(authorization,scope,tenant)
@@ -195,7 +234,12 @@ def from_environment():
     if not tokens or not signing or len(signing.encode())<32:
         raise RuntimeError('Set RECGUARD_TOKENS_JSON and a strong RECGUARD_SIGNING_KEY (min 32 bytes). Fail-closed startup.')
     ttl=int(os.getenv('RECGUARD_RECEIPT_TTL','300'))
-    return create_app(RecGuard(os.getenv('RECGUARD_DB','recguard.db'),signing.encode(),receipt_ttl=ttl),json.loads(tokens))
+    engine=RecGuard(os.getenv('RECGUARD_DB','recguard.db'),signing.encode(),receipt_ttl=ttl)
+    # Policy-as-code: comma-separated YAML/JSON packs loaded at startup. Packs that declare
+    # `context:` need host data and can only be loaded by an embedding application.
+    for path in filter(None,(x.strip() for x in os.getenv('RECGUARD_POLICY_PACKS','').split(','))):
+        engine.load_policy_pack(path,data_version=os.getenv('RECGUARD_POLICY_DATA_VERSION') or None)
+    return create_app(engine,json.loads(tokens),max_body_bytes=int(os.getenv('RECGUARD_MAX_BODY_BYTES','1000000')))
 
 # Secure-by-default: no default bearer tokens or signing keys.
 # Use `uvicorn recguard.api:from_environment --factory` (or `recguard serve`) to start.

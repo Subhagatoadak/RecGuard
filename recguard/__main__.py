@@ -46,6 +46,13 @@ def main(argv=None):
     a=sub.add_parser('audit',help='verify a tenant audit chain in a database file')
     a.add_argument('tenant');a.add_argument('--db',default=os.getenv('RECGUARD_DB','recguard.db'))
     a.add_argument('--expected-head')
+    pol=sub.add_parser('policy',help='work with YAML/JSON policy packs')
+    psub=pol.add_subparsers(dest='policy_cmd',required=True)
+    v=psub.add_parser('validate',help='check schema, expression syntax and names (no context values needed)')
+    v.add_argument('files',nargs='+')
+    sh=psub.add_parser('show',help='print the resolved pack (includes merged) as JSON')
+    sh.add_argument('file')
+    psub.add_parser('schema',help='print the JSON Schema for policy packs (for editor autocompletion)')
     args=parser.parse_args(argv)
     if args.cmd=='dev-env':
         dev_env(args.tenant,args.env_file)
@@ -53,6 +60,32 @@ def main(argv=None):
         try:import uvicorn
         except ImportError:sys.exit("install the server extra: pip install 'recguard-kernel[server]'")
         uvicorn.run('recguard.api:from_environment',factory=True,host=args.host,port=args.port,workers=1)
+    elif args.cmd=='policy':
+        from .policy_pack import PackError, PolicyPack, load_pack
+        if args.policy_cmd=='schema':
+            print(json.dumps(PolicyPack.model_json_schema(by_alias=True),indent=2));return
+        files=args.files if args.policy_cmd=='validate' else [args.file]
+        failed=False
+        for path in files:
+            try:
+                pack=load_pack(path)
+                pack.validate_names()
+            except (PackError,OSError) as exc:
+                failed=True
+                print(f'✗ {path}: {exc}',file=sys.stderr)
+                continue
+            if args.policy_cmd=='show':
+                print(json.dumps(pack.model_dump(mode='json',by_alias=True),indent=2))
+            else:
+                results=pack.run_tests()
+                bad=[r for r in results if not r['passed']]
+                failed|=bool(bad)
+                mark='✗' if bad else '✓'
+                print(f'{mark} {path}: pack {pack.name!r}, {len(pack.policies)} policies, {len(pack.checks)} checks, '
+                      f'context {pack.context or "none"}, tests {len(results)-len(bad)}/{len(results)} passed, digest {pack.digest[:12]}')
+                for r in bad:
+                    print(f'    ✗ test {r["name"]!r}: expected {r["expected"]!r}, got {r["got"]!r}',file=sys.stderr)
+        sys.exit(1 if failed else 0)
     elif args.cmd=='audit':
         key=os.environ.get('RECGUARD_SIGNING_KEY')
         if not key:sys.exit('RECGUARD_SIGNING_KEY is required')

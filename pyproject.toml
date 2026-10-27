@@ -13,7 +13,8 @@ dependencies = ["pydantic>=2.7"]
 
 [project.optional-dependencies]
 server = ["fastapi>=0.110", "uvicorn>=0.30"]
-test = ["pytest>=8", "httpx>=0.27", "fastapi>=0.110"]
+yaml = ["pyyaml>=6"]  # YAML policy packs (JSON packs need nothing extra)
+test = ["pytest>=8", "httpx>=0.27", "fastapi>=0.110", "pyyaml>=6"]
 
 [project.scripts]
 recguard = "recguard.__main__:main"

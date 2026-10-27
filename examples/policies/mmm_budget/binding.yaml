@@ -1,0 +1,22 @@
+# The submitted candidate must be exactly the trusted plan for this planning context.
+recguard: 1
+name: mmm-binding
+context: [PLANS, WEEKS, REGIONS, CHANNELS, canonical_candidate]
+constants:
+  PURPOSE: mmm-budget
+  approved_snapshot: {model_version: synthetic-mmm-v1, data_version: synthetic-weekly-data-v1}
+checks:
+  - name: binding-v1
+    description: Known plan, right context, canonical attributes, complete integer grid, approved model snapshot.
+    let:
+      plan: "get(PLANS, item.item_id)"
+      coords: "[(x.week, x.region, x.channel) for x in plan.lines]"
+      grid: "{(w, r, c) for w in WEEKS for r in REGIONS for c in CHANNELS}"
+    rules:
+      - {reject: UNKNOWN_PLAN, if: "plan is None"}
+      - {reject: CONTEXT_MISMATCH, if: "plan.context_id != request.subject_ref or request.purpose != PURPOSE"}
+      - {reject: PLAN_BINDING_MISMATCH, if: "item != canonical_candidate(item.item_id)"}
+      - {reject: INVALID_GRID, if: "len(coords) != len(grid) or set(coords) != grid"}
+      - {reject: INVALID_AMOUNT, if: "any(not is_int(x.amount) or x.amount < 0 for x in plan.lines)"}
+      - reject: UNAPPROVED_SNAPSHOT
+        if: "plan.model_version != approved_snapshot.model_version or plan.data_version != approved_snapshot.data_version"

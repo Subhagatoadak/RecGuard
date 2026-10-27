@@ -120,6 +120,40 @@ Policies compose across global (`tenant_id: null`) and tenant scope; the stricte
 
 `engine.effective_policy(tenant, purpose)` (or `GET /v1/policies/{tenant}?purpose=`) returns the composed result and its fingerprint.
 
+### Policy packs (YAML): policies and checks without code
+
+Put policies, thresholds and custom checks in a YAML (or JSON) file. Your application only passes in the data the rules read.
+
+```yaml
+recguard: 1
+name: shop-safety
+context: [CATALOG]                       # host data supplied at load time
+constants: {max_price: 5000}
+policies:
+  - {policy_id: base, version: 1, denied_categories: [rx-only], require_evidence: true}
+checks:
+  - name: catalog
+    let: {trusted: "get(CATALOG, item.item_id)"}
+    rules:                               # first matching rule rejects the item
+      - {reject: NOT_IN_CATALOG, if: "trusted is None"}
+      - {reject: TOO_EXPENSIVE, if: "trusted.price > max_price", unless: "request.purpose == 'audit'"}
+tests:                                   # run by `recguard policy validate`
+  - {name: pricey, context: {CATALOG: {a: {price: 9999}}}, item: {item_id: a}, expect: catalog:TOO_EXPENSIVE}
+```
+
+```python
+engine.load_policy_pack("shop-safety.yaml", context={"CATALOG": catalog}, data_version="catalog-2026-10")
+```
+
+* **Rules** are conditions over `item` (the candidate), `request`, the pack's `constants`, the declared `context`, and `let` bindings, which are computed lazily and once per item. `parse_item_id` (a regex with named groups) turns structured IDs such as `tv:increase:20` into variables.
+* **Expressions** use a safe subset of Python syntax: comparisons, `and`/`or`/`not`, arithmetic, indexing, `x.attr` on objects and mappings, comprehensions, and whitelisted functions (`len sum min max any all abs round get keys values items startswith endswith lower upper matches search range is_int …`). Expressions are parsed into a syntax tree and compiled to closures, never passed to `eval`. Imports, lambdas, assignment, method calls, keyword arguments, `__dunder__` access and attributes of functions or classes are rejected. Unknown names fail **at load time** with the file location. A runtime error fails closed (`CHECK_ERROR:<check>`), and each evaluation has a step budget that stops runaway loops.
+* **Fingerprints:** each check's content hash and the optional `data_version` are part of the policy fingerprint. Editing a rule or reloading with new data invalidates outstanding receipts.
+* **Reloading** a pack is idempotent. Unchanged policies are skipped, and the pack's checks are replaced. A changed policy body needs a new `version`; retire one with `enabled: false`. `include: [base.yaml]` composes packs.
+* **CLI:** `recguard policy validate packs/*.yaml` (schema, syntax, names and the pack's `tests:`), `recguard policy show pack.yaml` (resolved JSON), and `recguard policy schema > recguard-pack.schema.json` (editor autocompletion via `# yaml-language-server: $schema=recguard-pack.schema.json`).
+* **Server:** `RECGUARD_POLICY_PACKS=/etc/recguard/base.yaml,/etc/recguard/tenant.yaml` loads packs at startup (packs without `context:`; optional `RECGUARD_POLICY_DATA_VERSION`).
+
+Install YAML support with `pip install 'recguard-kernel[yaml]'`; JSON packs need nothing extra. Examples: [`examples/policies/`](examples/policies/), used by all three notebooks. Python `register_check` remains available for logic that doesn't fit a rule.
+
 ### Plug-ins: custom checks and rerankers
 
 ```python
@@ -131,13 +165,19 @@ Checks are AND-ed with policy, can only remove items, fail closed if they raise,
 
 ### Real-LLM walkthrough (notebook)
 
-[`examples/llm_guarded_recommendations.ipynb`](examples/llm_guarded_recommendations.ipynb) puts Claude behind RecGuard as the shopping assistant of an Indian online pharmacy. The LLM sees only the customer's request and the product listings. RecGuard enforces what lives in the backend: verified age, prescription-only (Schedule H) bans, consent, region licensing, stock, Trust & Safety flags, a prompt injection planted in a seller listing, and hallucinated or spoofed SKUs. It then signs, verifies, audits and meters the result.
+[`examples/llm_guarded_recommendations.ipynb`](examples/llm_guarded_recommendations.ipynb) puts Gemini behind RecGuard as the shopping assistant of an Indian online pharmacy. The LLM sees only the customer's request and the product listings. RecGuard enforces what lives in the backend: verified age, prescription-only (Schedule H) bans, consent, region licensing, stock, Trust & Safety flags, a prompt injection planted in a seller listing, and hallucinated or spoofed SKUs. It then signs, verifies, audits and meters the result.
 
 ```bash
 pip install jupyter && jupyter lab examples/llm_guarded_recommendations.ipynb
 ```
 
-The notebook reads `ANTHROPIC_API_KEY` from the environment, from the repo's gitignored `.env`, or from a hidden prompt. Three Opus 5.5 calls cost a few cents.
+The notebook reads `GEMINI_API_KEY` from the environment, from the repo's gitignored `.env`, or from a hidden prompt. It uses the Google Gen AI SDK with Gemini 2.5 Flash and makes four API calls (including the stress test).
+
+### MMM budget allocation benchmark (notebook)
+
+[`examples/mmm_budget_policy_benchmark.ipynb`](examples/mmm_budget_policy_benchmark.ipynb) benchmarks complete marketing budget plans across four channels, two regions, and four weeks. It includes synthetic adstock/saturation response curves, uncertainty draws, addable budget/pacing/concentration/risk policies, an independent feasibility oracle, policy ablations, checked fallbacks, receipt binding, and CSV/JSON exports. No API key is required. This is a synthetic policy benchmark, not a fitted causal MMM.
+
+Open the notebook and run all cells. Edit `Rules` and `EXTRA_POLICIES` to try new policy configurations. Generated reports go into `mmm_benchmark_outputs/` beside the notebook.
 
 ### Embedded Python SDK
 
@@ -193,6 +233,8 @@ A TypeScript caller is included in `examples/node_client.mjs`. Native client imp
 | `GET /v1/metrics/{tenant_id}/prometheus` | `metrics:read` | Minimal Prometheus exposition |
 | `GET /v1/audit/{tenant_id}/verify` | `audit:read` | Recompute audit-chain integrity; `?expected_head=` detects tail deletion |
 | `GET /v1/audit/{tenant_id}/head` | `audit:read` | Current chain head — anchor it externally |
+
+Server settings: `RECGUARD_POLICY_PACKS` (comma-separated pack files loaded at startup), `RECGUARD_POLICY_DATA_VERSION`, `RECGUARD_RECEIPT_TTL` (seconds, default 300) and `RECGUARD_MAX_BODY_BYTES` (default 1,000,000; larger requests get 413).
 
 Tokens are opaque; `RECGUARD_TOKENS_JSON` maps each bearer token to its tenant and scopes. The global-policy token belongs to tenant `*`; a service token for `acme` cannot read/write `other` tenant's data.
 

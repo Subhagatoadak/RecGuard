@@ -1,0 +1,35 @@
+recguard: 1
+name: mmm-budget
+context: [PLANS, CONTEXTS, WEEKS, REGIONS]
+checks:
+  - name: budget-v1
+    description: Currency, total budget, weekly pacing and regional envelopes must match exactly.
+    let:
+      p: "PLANS[item.item_id]"
+      r: "CONTEXTS[request.subject_ref]"
+    rules:
+      - {reject: CURRENCY_MISMATCH, if: "p.currency != 'INR'"}
+      - {reject: TOTAL_BUDGET, if: "sum(x.amount for x in p.lines) != r.total_budget"}
+      - {reject: WEEKLY_PACING, if: "any(sum(x.amount for x in p.lines if x.week == w) != r.weekly_budget for w in WEEKS)"}
+      - {reject: REGION_ENVELOPE, if: "any(sum(x.amount for x in p.lines if x.region == g) != r.region_budget for g in REGIONS)"}
+tests:
+  - name: balanced plan passes
+    context:
+      PLANS: {p: {currency: INR, lines: [{week: 1, region: n, amount: 50}, {week: 1, region: s, amount: 50},
+                                         {week: 2, region: n, amount: 50}, {week: 2, region: s, amount: 50}]}}
+      CONTEXTS: {c: {total_budget: 200, weekly_budget: 100, region_budget: 100}}
+      WEEKS: [1, 2]
+      REGIONS: [n, s]
+    item: {item_id: p}
+    request: {subject_ref: c}
+    expect: null
+  - name: front-loaded plan breaks weekly pacing
+    context:
+      PLANS: {p: {currency: INR, lines: [{week: 1, region: n, amount: 80}, {week: 1, region: s, amount: 70},
+                                         {week: 2, region: n, amount: 20}, {week: 2, region: s, amount: 30}]}}
+      CONTEXTS: {c: {total_budget: 200, weekly_budget: 100, region_budget: 100}}
+      WEEKS: [1, 2]
+      REGIONS: [n, s]
+    item: {item_id: p}
+    request: {subject_ref: c}
+    expect: budget-v1:WEEKLY_PACING

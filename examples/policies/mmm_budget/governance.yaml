@@ -1,0 +1,26 @@
+# Base governance for synthetic MMM budget plans. Edit limits here; the notebook builds
+# its Rules from `constants.limits`, and checks read them per planning context.
+recguard: 1
+name: mmm-governance
+description: One budget plan per request, evidence-bound, never explored by the bandit.
+constants:
+  limits:
+    total_budget: 400000          # INR per 4-week plan
+    weekly_budget: 100000
+    region_budget: 200000
+    max_channel_share: 0.45
+    min_search_share: 0.15
+    max_line_change: 0.80         # each week x region x channel line may move at most 80% from baseline
+    max_relative_uncertainty: 0.65
+    min_lower_roas: 0.10
+policies:
+  - policy_id: mmm-governance
+    version: 1
+    tenant_id: acme-marketing
+    purposes: [mmm-budget]
+    allowed_categories: [budget-plan]
+    require_evidence: true
+    high_impact: true
+    allow_experiment: false
+    min_results: 1
+    max_results: 1

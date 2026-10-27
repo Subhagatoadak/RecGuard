@@ -1,0 +1,9 @@
+# Drop-in extension: a tighter, versioned forecast-interval limit.
+recguard: 1
+name: mmm-interval-v2
+context: [FORECASTS]
+constants: {max_relative_uncertainty: 0.01}
+checks:
+  - name: interval-v2
+    rules:
+      - {reject: WIDE_INTERVAL, if: "FORECASTS[item.item_id].relative_uncertainty > max_relative_uncertainty"}

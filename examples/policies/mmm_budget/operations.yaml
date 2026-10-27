@@ -1,0 +1,16 @@
+recguard: 1
+name: mmm-operations
+context: [PLANS, CONTEXTS, CHANNELS]
+constants:
+  baseline_line: 12500            # INR per week x region x channel in the baseline plan
+checks:
+  - name: operations-v1
+    description: Channel concentration, search commitment and per-line churn limits.
+    let:
+      p: "PLANS[item.item_id]"
+      r: "CONTEXTS[request.subject_ref]"
+      totals: "{c: sum(x.amount for x in p.lines if x.channel == c) for c in CHANNELS}"
+    rules:
+      - {reject: CHANNEL_CONCENTRATION, if: "max(values(totals)) > r.max_channel_share * r.total_budget"}
+      - {reject: SEARCH_COMMITMENT, if: "totals['search'] < r.min_search_share * r.total_budget"}
+      - {reject: ABRUPT_REALLOCATION, if: "any(abs(x.amount - baseline_line) > baseline_line * r.max_line_change for x in p.lines)"}

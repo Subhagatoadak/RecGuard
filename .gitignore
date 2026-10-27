@@ -12,3 +12,6 @@ dist/
 *.sqlite-*
 .env
 .DS_Store
+
+# Generated notebook benchmark reports
+mmm_benchmark_outputs/

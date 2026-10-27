@@ -7,6 +7,7 @@ from typing import Callable
 from .contracts import Candidate, Decision, DecisionState, Outcome, Policy, Rejection, Request, Telemetry
 from .storage import Store, canon
 from . import learning
+from .policy_pack import PolicyPack, load_pack
 
 Check = Callable[[Candidate, Request], "str | None"]
 Strategy = Callable[[list[Candidate], int], list[Candidate]]
@@ -46,19 +47,68 @@ class RecGuard:
         self.db = Store(db_path, signing_key or secrets.token_bytes(32))
         self.receipt_ttl = receipt_ttl
         self._checks: dict[str, Check] = {}
+        self._check_digests: dict[str, str] = {}   # content hash for pack-defined checks
+        self._check_packs: dict[str, str] = {}     # check name -> pack name that owns it
         self._strategies: dict[str, tuple[Strategy, bool]] = {}
 
     # ---- extension points -------------------------------------------------
 
-    def register_check(self, name: str, fn: Check):
+    def register_check(self, name: str, fn: Check, digest: str | None = None):
         """Add a host-specific rule. Return a reason code to reject, None to allow.
 
         Checks are AND-ed with built-in policy; they can only remove items. A raising
-        check fails closed. Registered names are part of the policy fingerprint.
+        check fails closed. Names (and `digest`, when given) are part of the policy
+        fingerprint, so changing a check invalidates outstanding receipts.
         """
         if not NAME.match(name) or name in self._checks:
             raise ValueError("check name must be a unique identifier")
         self._checks[name] = fn
+        if digest is not None:
+            self._check_digests[name] = digest
+
+    def unregister_check(self, name: str):
+        if name not in self._checks:
+            raise ValueError(f"no check named {name!r}")
+        del self._checks[name]
+        self._check_digests.pop(name, None)
+        self._check_packs.pop(name, None)
+
+    def load_policy_pack(self, source, context: dict | None = None, data_version: str | None = None) -> dict:
+        """Register a YAML/JSON policy pack: its policies (monotonic versions) and declarative checks.
+
+        `context` supplies the host data the pack declares (catalogs, model outputs, helper
+        functions). Reloading is idempotent: unchanged policies are skipped and the pack's
+        own checks are replaced, so an edited rule takes effect and changes the fingerprint.
+        `data_version` names the version of the context data (e.g. a catalog or model run);
+        it is part of the fingerprint, so reloading with new data invalidates old receipts.
+        """
+        pack = source if isinstance(source, PolicyPack) else load_pack(source)
+        compiled = pack.compile(context)
+        foreign = [n for n in compiled if n in self._checks and self._check_packs.get(n) != pack.name]
+        if foreign:
+            raise ValueError(f"check name(s) {foreign} already registered outside pack {pack.name!r}")
+        registered, unchanged = [], []
+        with self.db.tx():
+            for policy in pack.policies:
+                current = next((p for p in self.policies(policy.tenant_id or "*")
+                                if p.policy_id == policy.policy_id and (p.tenant_id or "*") == (policy.tenant_id or "*")), None)
+                if current is not None and current == policy:
+                    unchanged.append(f"{policy.policy_id}@v{policy.version}")
+                    continue
+                self.register_policy(policy)
+                registered.append(f"{policy.policy_id}@v{policy.version}")
+            for name in [n for n, owner in self._check_packs.items() if owner == pack.name]:
+                self.unregister_check(name)
+            for spec in pack.checks:
+                digest=pack.check_digest(spec)
+                if data_version is not None:
+                    digest=hashlib.sha256(f"{digest}:{data_version}".encode()).hexdigest()
+                self.register_check(spec.name, compiled[spec.name], digest=digest)
+                self._check_packs[spec.name] = pack.name
+            summary = {"pack": pack.name, "digest": pack.digest, "data_version": data_version, "policies_registered": registered,
+                       "policies_unchanged": unchanged, "checks": [c.name for c in pack.checks]}
+            self.db.audit("*", "POLICY_PACK_LOADED", summary)
+        return summary
 
     def register_strategy(self, name: str, fn: Strategy, explore: bool = True):
         """Add a reranker fn(eligible_candidates, k) -> ordered subset.
@@ -99,7 +149,7 @@ class RecGuard:
         return [Policy.model_validate_json(row["body"]) for row in rows]
 
     def _policy(self, tenant: str, purpose: str) -> EffectivePolicy | None:
-        relevant=[p for p in self.policies(tenant) if not p.purposes or purpose in p.purposes]
+        relevant=[p for p in self.policies(tenant) if p.enabled and (not p.purposes or purpose in p.purposes)]
         if not relevant:
             return None
         allowed=[set(p.allowed_regions) for p in relevant if p.allowed_regions is not None]
@@ -107,7 +157,8 @@ class RecGuard:
         scores=[p.min_score for p in relevant if p.min_score is not None]
         caps=[p.max_per_category for p in relevant if p.max_per_category is not None]
         body=[p.model_dump(mode="json") for p in sorted(relevant, key=lambda x:(x.tenant_id or "*",x.policy_id,x.version))]
-        fp=hashlib.sha256(canon({"policies":body,"checks":sorted(self._checks)}).encode()).hexdigest()
+        checks={name:self._check_digests.get(name,"code") for name in sorted(self._checks)}
+        fp=hashlib.sha256(canon({"policies":body,"checks":checks}).encode()).hexdigest()
         return EffectivePolicy(
             denied=frozenset(cat for p in relevant for cat in p.denied_categories),
             regions=frozenset(set.intersection(*allowed)) if allowed else None,

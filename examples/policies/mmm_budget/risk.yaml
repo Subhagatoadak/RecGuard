@@ -1,0 +1,27 @@
+recguard: 1
+name: mmm-risk
+context: [FORECASTS, CONTEXTS]
+checks:
+  - name: risk-v1
+    description: Forecast uncertainty and pessimistic ROAS limits.
+    let:
+      f: "FORECASTS[item.item_id]"
+      r: "CONTEXTS[request.subject_ref]"
+    rules:
+      - {reject: WIDE_INTERVAL, if: "f.relative_uncertainty > r.max_relative_uncertainty"}
+      - {reject: LOWER_ROAS, if: "f.lower_roas < r.min_lower_roas"}
+tests:
+  - name: confident, profitable plan passes
+    context:
+      FORECASTS: {plan-a: {relative_uncertainty: 0.2, lower_roas: 1.4}}
+      CONTEXTS: {ctx-1: {max_relative_uncertainty: 0.65, min_lower_roas: 0.10}}
+    item: {item_id: plan-a}
+    request: {subject_ref: ctx-1}
+    expect: null
+  - name: wide forecast interval is rejected
+    context:
+      FORECASTS: {plan-a: {relative_uncertainty: 0.9, lower_roas: 1.4}}
+      CONTEXTS: {ctx-1: {max_relative_uncertainty: 0.65, min_lower_roas: 0.10}}
+    item: {item_id: plan-a}
+    request: {subject_ref: ctx-1}
+    expect: risk-v1:WIDE_INTERVAL
