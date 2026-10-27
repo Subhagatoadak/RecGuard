@@ -4,7 +4,7 @@ import hashlib, hmac, json, re, secrets, sqlite3, time
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable
-from .contracts import Candidate, Decision, DecisionState, Outcome, Policy, Rejection, Request, Telemetry
+from .contracts import Candidate, Decision, DecisionState, Outcome, Policy, Rejection, Request, ShadowReport, Telemetry
 from .storage import Store, canon
 from . import learning
 from .policy_pack import PolicyPack, load_pack
@@ -51,6 +51,7 @@ class RecGuard:
         self._check_digests: dict[str, str] = {}   # content hash for pack-defined checks
         self._check_packs: dict[str, str] = {}     # check name -> pack name that owns it
         self._decision_checks: dict[str, tuple[DecisionCheck, str]] = {}  # name -> (fn, "block"|"trim")
+        self._shadow: dict[str, dict] = {}  # pack name -> {"policies", "checks", "decision_checks"}; reported, never enforced
         self._strategies: dict[str, tuple[Strategy, bool]] = {}
 
     # ---- extension points -------------------------------------------------
@@ -101,6 +102,16 @@ class RecGuard:
         pack = source if isinstance(source, PolicyPack) else load_pack(source)
         compiled = pack.compile(context)
         compiled_decisions = pack.compile_decisions(context)
+        if pack.mode == "shadow":
+            with self.db.tx():
+                self._shadow[pack.name] = {"policies": list(pack.policies), "checks": compiled,
+                                           "decision_checks": {s.name: (compiled_decisions[s.name], s.on_violation) for s in pack.decision_checks}}
+                summary = {"pack": pack.name, "mode": "shadow", "digest": pack.digest, "data_version": data_version,
+                           "policies": [f"{p.policy_id}@v{p.version}" for p in pack.policies],
+                           "checks": list(compiled), "decision_checks": list(compiled_decisions)}
+                self.db.audit("*", "POLICY_PACK_SHADOWED", summary)
+            return summary
+        self._shadow.pop(pack.name, None)  # enforcing a pack ends its shadow run
         foreign = [n for n in [*compiled, *compiled_decisions]
                    if (n in self._checks or n in self._decision_checks) and self._check_packs.get(n) != pack.name]
         if foreign:
@@ -129,7 +140,7 @@ class RecGuard:
                     digest=hashlib.sha256(f"{digest}:{data_version}".encode()).hexdigest()
                 self.register_decision_check(spec.name, compiled_decisions[spec.name], spec.on_violation, digest=digest)
                 self._check_packs[spec.name] = pack.name
-            summary = {"pack": pack.name, "digest": pack.digest, "data_version": data_version, "policies_registered": registered,
+            summary = {"pack": pack.name, "mode": "enforce", "digest": pack.digest, "data_version": data_version, "policies_registered": registered,
                        "policies_unchanged": unchanged, "checks": [c.name for c in pack.checks],
                        "decision_checks": [c.name for c in pack.decision_checks]}
             self.db.audit("*", "POLICY_PACK_LOADED", summary)
@@ -173,8 +184,12 @@ class RecGuard:
                 ON p.tenant=l.tenant AND p.id=l.id AND p.version=l.version ORDER BY p.tenant,p.id""", (tenant,)).fetchall()
         return [Policy.model_validate_json(row["body"]) for row in rows]
 
-    def _policy(self, tenant: str, purpose: str) -> EffectivePolicy | None:
-        relevant=[p for p in self.policies(tenant) if p.enabled and (not p.purposes or purpose in p.purposes)]
+    def _policy(self, tenant: str, purpose: str, overlay: list[Policy] | None = None) -> EffectivePolicy | None:
+        latest={((p.tenant_id or "*"),p.policy_id):p for p in self.policies(tenant)}
+        for p in overlay or ():  # shadow policies replace or add to the live set, in memory only
+            if (p.tenant_id or "*") in ("*",tenant):
+                latest[((p.tenant_id or "*"),p.policy_id)]=p
+        relevant=[p for p in latest.values() if p.enabled and (not p.purposes or purpose in p.purposes)]
         if not relevant:
             return None
         allowed=[set(p.allowed_regions) for p in relevant if p.allowed_regions is not None]
@@ -214,7 +229,7 @@ class RecGuard:
                 "max_per_category":pol.max_per_category,"allow_experiment":pol.experiment,"high_impact":pol.high_impact,
                 "custom_checks":sorted(self._checks)}
 
-    def _check(self, c:Candidate, req:Request, pol:EffectivePolicy) -> str | None:
+    def _check(self, c:Candidate, req:Request, pol:EffectivePolicy, checks:dict|None=None) -> str | None:
         if c.tenant_id != req.tenant_id: return "CROSS_TENANT"
         if not c.available: return "UNAVAILABLE"
         if c.item_id in pol.denied_items: return "DENIED_ITEM"
@@ -226,7 +241,7 @@ class RecGuard:
         if pol.evidence and not c.evidence_ids:return "EVIDENCE_REQUIRED"
         if pol.consent and not req.personalization_consent and c.uses_personal_data:return "CONSENT_REQUIRED"
         if pol.min_score is not None and c.score<pol.min_score:return "SCORE_BELOW_MINIMUM"
-        for name,fn in self._checks.items():
+        for name,fn in (self._checks if checks is None else checks).items():
             try:
                 reason=fn(c.model_copy(deep=True),req)
             except Exception:
@@ -374,6 +389,56 @@ class RecGuard:
                 changed=True
         return changed
 
+    def _shadow_verdict(self, req:Request, output:list[Candidate], rejections:list[Rejection]) -> ShadowReport:
+        """Re-judge this decision under live + shadow rules without changing it."""
+        try:
+            overlay=[p for pack in self._shadow.values() for p in pack["policies"]]
+            pol=self._policy(req.tenant_id,req.purpose,overlay=overlay)
+            checks={**self._checks,**{n:f for pack in self._shadow.values() for n,f in pack["checks"].items()}}
+            report=ShadowReport()
+            if pol is None:
+                report.would_reject=[Rejection(item_id=x.item_id,reason="NO_APPLICABLE_POLICY",source="shadow") for x in output]
+                return report
+            for item in output:
+                reason=self._check(item,req,pol,checks)
+                if reason:
+                    report.would_reject.append(Rejection(item_id=item.item_id,reason=reason,source="shadow"))
+            for r in rejections:
+                if r.source=="candidates":
+                    item=next((x for x in req.candidates if x.item_id==r.item_id),None)
+                    if item is not None and r.reason!="DUPLICATE_ITEM" and self._check(item,req,pol,checks) is None:
+                        report.would_admit.append(item.item_id)
+            kept=[x for x in output if x.item_id not in {r.item_id for r in report.would_reject}]
+            for pack in self._shadow.values():
+                for name,(fn,_) in pack["decision_checks"].items():
+                    try:
+                        reason=fn(list(kept),req)
+                    except Exception:
+                        reason="CHECK_ERROR"
+                    if reason is not None:
+                        report.decision_violations.append(f"{name}:{reason}")
+            return report
+        except Exception as exc:  # shadow evaluation must never affect serving
+            return ShadowReport(error=f"{type(exc).__name__}: {exc}")
+
+    def shadow_report(self, tenant:str) -> dict:
+        """Aggregate shadow verdicts logged for a tenant: what enforcing the shadow packs would change."""
+        with self.db.tx() as c:
+            rows=c.execute("SELECT status,shadow FROM decisions WHERE tenant=? AND shadow!='{}'",(tenant,)).fetchall()
+        reject,decision=Counter(),Counter()
+        affected=admit=errors=0
+        for row in rows:
+            data=json.loads(row["shadow"])
+            reject.update(data.get("reject",{}))
+            decision.update(data.get("decision",[]))
+            admit+=data.get("admit",0)
+            errors+=bool(data.get("error"))
+            affected+=bool(data.get("reject") or data.get("decision") or data.get("admit"))
+        return {"tenant_id":tenant,"shadow_packs":sorted(self._shadow),"decisions_evaluated":len(rows),
+                "decisions_affected":affected,"affected_rate":round(affected/len(rows),4) if rows else None,
+                "would_reject_items":dict(reject),"would_admit_items":admit,"decision_violations":dict(decision),
+                "errors":errors}
+
     def evaluate(self,req:Request)->Decision:
         # One transaction: kill switch, policy, strategy and the logged decision are consistent.
         with self.db.tx() as c:
@@ -412,18 +477,21 @@ class RecGuard:
             else:
                 # Truncating to k or reordering is normal ranking, not a repair.
                 status=DecisionState.REPAIRED if repaired else DecisionState.PASS
+            shadow=self._shadow_verdict(req,output,rejections) if self._shadow and enabled else None
+            shadow_row={} if shadow is None else {"reject":dict(Counter(r.reason for r in shadow.would_reject)),
+                        "admit":len(shadow.would_admit),"decision":shadow.decision_violations,"error":shadow.error}
             did=secrets.token_hex(16)
             exp=int(time.time())+self.receipt_ttl
             fp=pol.fingerprint if pol else "SERVING_DISABLED" if not enabled else "NO_POLICY"
             oh=self._hash_results(output)
             sig=self._signature(req.tenant_id,did,oh,exp,fp)
             codes=sorted(reasons)
-            c.execute("""INSERT INTO decisions(id,tenant,request_id,purpose,segment,strategy,propensity,policy_hash,status,output_hash,receipt,exp,at,candidate_count,eligible_count,reasons)
-                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(did,req.tenant_id,req.request_id,req.purpose,req.segment,strategy,prob,fp,status.value,oh,sig,exp,time.time(),all_count,len(seen),canon(codes)))
+            c.execute("""INSERT INTO decisions(id,tenant,request_id,purpose,segment,strategy,propensity,policy_hash,status,output_hash,receipt,exp,at,candidate_count,eligible_count,reasons,shadow)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(did,req.tenant_id,req.request_id,req.purpose,req.segment,strategy,prob,fp,status.value,oh,sig,exp,time.time(),all_count,len(seen),canon(codes),canon({"evaluated":1,**{k:v for k,v in shadow_row.items() if v}} if shadow is not None else {})))
             self.db.audit(req.tenant_id,"DECISION",{"decision_id":did,"request_id":req.request_id,"status":status.value,"policy_fingerprint":fp,"reason_codes":codes,"strategy":strategy,"candidate_count":all_count,"eligible_count":len(seen),"result_count":len(output)})
         return Decision(decision_id=did,request_id=req.request_id,tenant_id=req.tenant_id,status=status,results=output,
                         strategy=strategy,propensity=prob,policy_fingerprint=fp,reason_codes=codes,receipt=sig,expires_at=exp,
-                        rejections=rejections)
+                        rejections=rejections,shadow=shadow)
 
     def evaluate_many(self, requests:list[Request]) -> list[Decision]:
         return [self.evaluate(r) for r in requests]

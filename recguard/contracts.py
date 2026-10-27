@@ -78,6 +78,13 @@ class Rejection(Strict):
     reason: str
     source: str  # "candidates" or "fallback"
 
+class ShadowReport(Strict):
+    """What shadow-mode packs would change; never affects what is served."""
+    would_reject: list[Rejection] = Field(default_factory=list)   # served items the shadow rules remove
+    would_admit: list[ID] = Field(default_factory=list)           # rejected items the shadow rules allow
+    decision_violations: list[str] = Field(default_factory=list)  # shadow decision checks that would fire
+    error: str | None = None
+
 class Decision(Strict):
     decision_id: ID
     request_id: ID
@@ -91,6 +98,7 @@ class Decision(Strict):
     receipt: str
     expires_at: int
     rejections: list[Rejection] = Field(default_factory=list)  # explain why each item was dropped
+    shadow: ShadowReport | None = None  # present when shadow-mode packs are loaded
 
 class Telemetry(Strict):
     event_id: ID

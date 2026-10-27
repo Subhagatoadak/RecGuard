@@ -101,6 +101,7 @@ class PolicyPack(BaseModel):
     recguard: Literal[1]
     name: ID
     description: str = ""
+    mode: Literal["enforce", "shadow"] = "enforce"  # shadow: evaluate and report, never change outcomes
     include: list[str] = Field(default_factory=list)
     context: list[str] = Field(default_factory=list)
     constants: dict[str, Any] = Field(default_factory=dict)

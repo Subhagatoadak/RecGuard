@@ -190,6 +190,11 @@ def create_app(engine:RecGuard,token_mapping:dict,max_body_bytes:int=1_000_000)-
         authorize(authorization,tenant_id,'metrics:read')
         return engine.metrics(tenant_id)
 
+    @app.get('/v1/shadow/{tenant_id}')
+    def shadow(tenant_id:str,authorization:str|None=Header(default=None)):
+        authorize(authorization,tenant_id,'metrics:read')
+        return engine.shadow_report(tenant_id)
+
     @app.get('/v1/metrics/{tenant_id}/prometheus',response_class=PlainTextResponse)
     def prometheus(tenant_id:str,authorization:str|None=Header(default=None)):
         authorize(authorization,tenant_id,'metrics:read')

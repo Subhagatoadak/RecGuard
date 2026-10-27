@@ -3,7 +3,15 @@ from __future__ import annotations
 import sqlite3, threading, hashlib, hmac, json, time
 from contextlib import contextmanager
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Columns added after v0, created on fresh databases and added in place on older ones.
+DECISION_COLUMNS = {
+    "reasons": "TEXT NOT NULL DEFAULT '[]'",
+    "shadow": "TEXT NOT NULL DEFAULT '{}'",        # shadow-mode verdict summary (v2)
+    "approval": "TEXT",                              # NULL | pending | approved | rejected (v2)
+    "reviews": "TEXT NOT NULL DEFAULT '[]'",       # reasons a human review is required (v2)
+    "reviewer": "TEXT",                              # who approved/rejected (v2)
+}
 
 
 def canon(obj: object) -> str:
@@ -29,11 +37,10 @@ class Store:
                 c.execute("ALTER TABLE events RENAME TO events_v0")
                 c.execute("ALTER TABLE outcomes RENAME TO outcomes_v0")
                 c.execute("DROP INDEX IF EXISTS ix_outcome_decision")
-                c.execute("ALTER TABLE decisions ADD COLUMN reasons TEXT NOT NULL DEFAULT '[]'")
             for statement in """
                 CREATE TABLE IF NOT EXISTS policies(tenant TEXT, id TEXT, version INTEGER, purpose TEXT, body TEXT, PRIMARY KEY(tenant,id,version));
                 CREATE TABLE IF NOT EXISTS state(tenant TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'OFF', active_strategy TEXT NOT NULL DEFAULT 'base', serving_disabled INTEGER NOT NULL DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, tenant TEXT NOT NULL, request_id TEXT NOT NULL, purpose TEXT NOT NULL, segment TEXT NOT NULL, strategy TEXT NOT NULL, propensity REAL NOT NULL, policy_hash TEXT NOT NULL, status TEXT NOT NULL, output_hash TEXT NOT NULL, receipt TEXT NOT NULL, exp INTEGER NOT NULL, at REAL NOT NULL, candidate_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL, reasons TEXT NOT NULL DEFAULT '[]');
+                CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, tenant TEXT NOT NULL, request_id TEXT NOT NULL, purpose TEXT NOT NULL, segment TEXT NOT NULL, strategy TEXT NOT NULL, propensity REAL NOT NULL, policy_hash TEXT NOT NULL, status TEXT NOT NULL, output_hash TEXT NOT NULL, receipt TEXT NOT NULL, exp INTEGER NOT NULL, at REAL NOT NULL, candidate_count INTEGER NOT NULL, eligible_count INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS events(id TEXT NOT NULL, tenant TEXT NOT NULL, decision_id TEXT, kind TEXT NOT NULL, latency_ms REAL, token_count INTEGER, cost_usd REAL, at REAL NOT NULL, PRIMARY KEY(tenant,id));
                 CREATE TABLE IF NOT EXISTS presentations(decision_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS outcomes(id TEXT NOT NULL, tenant TEXT NOT NULL, decision_id TEXT NOT NULL UNIQUE, reward REAL NOT NULL, kind TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY(tenant,id));
@@ -48,6 +55,10 @@ class Store:
                 c.execute("INSERT INTO outcomes SELECT * FROM outcomes_v0")
                 c.execute("DROP TABLE events_v0")
                 c.execute("DROP TABLE outcomes_v0")
+            existing = {row[1] for row in c.execute("PRAGMA table_info(decisions)").fetchall()}
+            for column, ddl in DECISION_COLUMNS.items():
+                if column not in existing:
+                    c.execute(f"ALTER TABLE decisions ADD COLUMN {column} {ddl}")
             c.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     @contextmanager
